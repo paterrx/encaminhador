@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 # forward_bot.py
 
 import os, ast, asyncio, threading
