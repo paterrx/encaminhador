@@ -1,6 +1,3 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 # forward_bot.py
 
 import os, ast, asyncio, threading
@@ -21,12 +18,11 @@ def run_flask():
 
 # ---------- Bot Telegram ----------
 async def start_bot():
-    # Lê vars de ambiente
-    api_id        = int(os.environ['TELEGRAM_API_ID'])
-    api_hash      = os.environ['TELEGRAM_API_HASH']
-    session_str   = os.environ['SESSION_STRING']
-    dest_chat_id  = int(os.environ['DEST_CHAT_ID'])
-    source_ids    = ast.literal_eval(os.environ['SOURCE_CHAT_IDS'])
+    api_id       = int(os.environ['TELEGRAM_API_ID'])
+    api_hash     = os.environ['TELEGRAM_API_HASH']
+    session_str  = os.environ['SESSION_STRING']
+    dest_chat_id = int(os.environ['DEST_CHAT_ID'])
+    source_ids   = ast.literal_eval(os.environ['SOURCE_CHAT_IDS'])
 
     client = TelegramClient(StringSession(session_str), api_id, api_hash)
     await client.start()
@@ -49,7 +45,5 @@ async def start_bot():
 
 # ---------- Entrada principal ----------
 if __name__ == '__main__':
-    # 1) levanta o servidor HTTP em background
     threading.Thread(target=run_flask, daemon=True).start()
-    # 2) inicia o bot
     asyncio.run(start_bot())
