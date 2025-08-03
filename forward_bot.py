@@ -33,7 +33,7 @@ async def start_bot():
     async def handler(event):
         msg = event.message
 
-        # Pega o remetente de forma genérica
+        # Determina nome do remetente
         sender = await event.get_sender()
         if hasattr(sender, 'first_name'):
             sender_name = sender.first_name
@@ -44,11 +44,7 @@ async def start_bot():
 
         header = f"🚀 {event.chat.title} — {sender_name}:\n"
 
-        # Reenvia texto
-        if msg.text:
-            await client.send_message(dest_chat_id, header + msg.text)
-
-        # Reenvia mídia
+        # Se houver mídia (foto, vídeo, arquivo, link-preview...), envia só ela com legenda
         if msg.media:
             path = await msg.download_media()
             await client.send_file(
@@ -61,12 +57,17 @@ async def start_bot():
             except:
                 pass
 
+        # Se for só texto, envia só o texto
+        elif msg.text:
+            await client.send_message(
+                dest_chat_id,
+                header + msg.text
+            )
+
     print("🤖 Bot rodando.")
     await client.run_until_disconnected()
 
 # ---------- Entrada principal ----------
 if __name__ == '__main__':
-    # 1) Sobe o server Flask em background
     threading.Thread(target=run_flask, daemon=True).start()
-    # 2) Sobe o bot
     asyncio.run(start_bot())
