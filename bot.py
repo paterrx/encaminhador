@@ -1,11 +1,12 @@
-import os, json
+import os, json, threading               # <-- importe threading aqui
+from flask import Flask                  # <-- importe Flask
 from telegram import Update, Chat
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     MessageHandler, filters, ContextTypes
 )
 
-# --- Persistência em JSON ---
+# --- persistência em JSON ---
 DATA_FILE = 'subscriptions.json'
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE, 'r') as f:
@@ -21,24 +22,21 @@ def save_subs():
 def is_admin(user_id: int) -> bool:
     return user_id == int(os.environ['ADMIN_ID'])
 
-# Monta texto de exemplo/uso de cada comando
 HELP_TEXT = {
-    'setdest':   "📌 Use /setdest dentro do grupo *paterra Tips* para defini-lo como destino.",
-    'addsource': "➕ Use /addsource dentro de cada grupo-fonte onde quer encaminhar.",
+    'setdest':     "📌 Use /setdest dentro do grupo paterra Tips para defini-lo como destino.",
+    'addsource':   "➕ Use /addsource dentro de cada grupo-fonte onde quer encaminhar.",
     'listsources': "📋 Use /listsources em DM para ver suas fontes pessoais e as fixas (admin).",
-    'removesource': "🗑️ Use /removesource <ID_grupo> em DM para retirar uma fonte que você adicionou."
+    'removesource':"🗑️ Use /removesource <ID_grupo> em DM para retirar uma fonte que você adicionou."
 }
 
-# --- Handlers de comandos ---
-
+# --- Handlers de comando ---
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 *Bem-vindo ao Encaminhador!*\n\n"
-        "Passo a passo:\n"
-        "1️⃣ Adicione-me no grupo *paterra Tips* e, DENTRO dele, envie /setdest\n"
-        "2️⃣ Adicione-me em cada grupo de apostas e, DENTRO deles, envie /addsource\n"
-        "3️⃣ Tudo que chegar nesses grupos aparecerá em *paterra Tips* automaticamente!\n\n"
-        "Para ver comandos disponíveis, digite /help"
+        "1️⃣ Adicione-me no grupo *paterra Tips* e envie /setdest lá.\n"
+        "2️⃣ Adicione-me em cada grupo-fonte e envie /addsource lá.\n"
+        "3️⃣ Tudo que chegar nesses grupos será enviado para *paterra Tips*.\n\n"
+        "Use /help para ver o guia de comandos."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -46,18 +44,18 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["*Guia de comandos:*"]
     for cmd, desc in HELP_TEXT.items():
         lines.append(f"/{cmd} — {desc}")
-    lines.append("\nUse /start para o passo-a-passo completo.")
+    lines.append("\nUse /start para o passo-a-passo.")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def setdest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     uid  = update.effective_user.id
     if not is_admin(uid):
-        return await update.message.reply_text("❌ Somente o admin pode usar /setdest.")
+        return await update.message.reply_text("❌ Só o admin pode usar /setdest.")
     if chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
         return await update.message.reply_text(HELP_TEXT['setdest'], parse_mode="Markdown")
     subs['admin'] = subs.get('admin', {})
-    subs['admin']['dest'] = chat.id
+    subs['admin']['dest']   = chat.id
     subs['admin']['always'] = subs['admin'].get('always', [])
     save_subs()
     await update.message.reply_text(f"✅ Destino definido: *{chat.title}* (`{chat.id}`)", parse_mode="Markdown")
@@ -67,14 +65,14 @@ async def addsource(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = str(update.effective_user.id)
     info = subs.get('admin')
     if not info or 'dest' not in info:
-        return await update.message.reply_text("❌ O admin ainda não definiu o destino.")
+        return await update.message.reply_text("❌ Admin ainda não definiu destino.")
     if chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
         return await update.message.reply_text(HELP_TEXT['addsource'], parse_mode="Markdown")
 
     gid = chat.id
     title = chat.title or str(gid)
 
-    # Admin adiciona fonte fixa
+    # admin adiciona fonte fixa
     if is_admin(update.effective_user.id):
         if gid in info['always']:
             return await update.message.reply_text("⚠️ Já é fonte fixa.")
@@ -82,7 +80,7 @@ async def addsource(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_subs()
         return await update.message.reply_text(f"📌 Fonte fixa adicionada: *{title}* (`{gid}`)", parse_mode="Markdown")
 
-    # Usuário normal adiciona na própria lista
+    # usuário comum adiciona na própria lista
     user_key = f"user:{uid}"
     subs.setdefault(user_key, {'sources': []})
     user_list = subs[user_key]['sources']
@@ -119,7 +117,7 @@ async def removesource(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_subs()
     await update.message.reply_text(f"🗑️ Você desinscreveu o grupo `{gid}`.", parse_mode="Markdown")
 
-# --- Handler de qualquer mensagem para forwarding ---
+# --- Captura e encaminha tudo o mais ---
 async def forward_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     info = subs.get('admin', {})
@@ -130,15 +128,13 @@ async def forward_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sources.update(subs.get(f"user:{update.effective_user.id}", {}).get('sources', []))
     if chat_id not in sources:
         return
-    # copia texto + mídia + previews
     await update.message.copy(chat_id=dest)
 
-# --- Main ---
+# --- Montagem e execução ---
 def main():
     token = os.environ['BOT_TOKEN']
     app   = ApplicationBuilder().token(token).build()
 
-    # registra handlers
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', help_command))
     app.add_handler(CommandHandler('setdest', setdest))
@@ -147,8 +143,13 @@ def main():
     app.add_handler(CommandHandler('removesource', removesource))
     app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), forward_messages))
 
-    # start
-    threading.Thread(target=lambda: Flask('keep_alive').run(host='0.0.0.0', port=int(os.environ.get('PORT',5000))), daemon=True).start()
+    # keep-alive HTTP server
+    flask_app = Flask('keep_alive')
+    threading.Thread(
+        target=lambda: flask_app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000))),
+        daemon=True
+    ).start()
+
     app.run_polling()
 
 if __name__ == '__main__':
