@@ -1,2 +1,1 @@
-worker: python main.py
-web: streamlit run dashboard.py --server.port $PORT
+web: bash -lc "python main.py & streamlit run dashboard.py --server.port \$PORT"
