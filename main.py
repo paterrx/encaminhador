@@ -1,3 +1,7 @@
+# main.py
+# BotFather userbot para encaminhar mensagens de grupos e channels,
+# agora com fallback para grupos que desativaram o forward.
+
 import os
 import json
 import asyncio
@@ -14,15 +18,15 @@ BOT_TOKEN       = os.environ['BOT_TOKEN']
 DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])
 SESSION_STRING  = os.environ['SESSION_STRING']
 SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
-# Exemplo: SOURCE_CHAT_IDS='[-1002460735067,-1002455542600,-1002794084735]'
+# Ex: SOURCE_CHAT_IDS='[-1002460735067,-1002455542600,-1002794084735]'
 
-# ── Persistência em arquivos ──────────────────────────────────────────────────
-SESS_FILE = 'sessions.json'       # { user_id: session_str, ... }
-SUBS_FILE = 'subscriptions.json'  # { user_id: [group_id, ...], ... }
+# ── Persistência ─────────────────────────────────────────────────────────────
+SESS_FILE = 'sessions.json'
+SUBS_FILE = 'subscriptions.json'
 
 def load(fname):
     try:
-        return json.load(open(fname, 'r'))
+        return json.load(open(fname, 'r', encoding='utf-8'))
     except:
         return {}
 
@@ -33,9 +37,8 @@ def save(fname, data):
 sessions      = load(SESS_FILE)
 subscriptions = load(SUBS_FILE)
 
-# ── HTTP keep-alive para Railway ──────────────────────────────────────────────
+# ── Keep-alive HTTP para Railway ──────────────────────────────────────────────
 app = Flask('keep_alive')
-
 @app.route('/')
 def home():
     return 'OK'
@@ -56,7 +59,7 @@ async def handler(ev):
         await reply(
             "**👋 Bem-vindo ao Encaminhador!**\n\n"
             "🔗 Gere sua Session online (Colab):\n"
-            "[Clique aqui](<https://colab.research.google.com/drive/1H3vHoNr_8CGW0rLEV-fFKKINo8mHWr5U?usp=sharing>)\n\n"
+            "[Clique aqui](https://colab.research.google.com/drive/1H3vHoNr_8CGW0rLEV-fFKKINo8mHWr5U?usp=sharing)\n\n"
             "**Fluxo:**\n"
             "1️⃣ `/setsession SUA_SESSION`\n"
             "2️⃣ `/listgroups`\n"
@@ -80,15 +83,9 @@ async def handler(ev):
 
     if text == '/listgroups':
         dialogs = await client.get_dialogs()
-        lines = [
-            f"{d.title or 'Sem título'} — `{d.id}`"
-            for d in dialogs
-            if d.is_group or d.is_channel
-        ]
-        await reply(
-            "📋 *Seus grupos:*\n" + "\n".join(lines[:50]),
-            parse_mode='Markdown'
-        )
+        lines = [f"{d.title or 'Sem título'} — `{d.id}`" for d in dialogs if d.is_group or d.is_channel]
+        await reply("📋 *Seus grupos:*
+" + "\n".join(lines[:50]), parse_mode='Markdown')
         return
 
     if text.startswith('/subscribe '):
@@ -126,8 +123,24 @@ async def forward_initial(ev):
     title = getattr(chat, 'title', None) or str(ev.chat_id)
     header = f"📢 *{title}* (`{ev.chat_id}`)"
     await admin_client.send_message(DEST_CHAT_ID, header, parse_mode='Markdown')
-    # use forward_to em vez de copy
-    await ev.message.forward_to(DEST_CHAT_ID)
+
+    # tenta forward_to e cai no fallback
+    try:
+        await ev.message.forward_to(DEST_CHAT_ID)
+    except Exception:
+        # fallback manual: texto + mídia
+        msg = ev.message
+        if msg.media:
+            await admin_client.send_file(
+                DEST_CHAT_ID,
+                file=msg.media,
+                caption=msg.text or ''
+            )
+        else:
+            await admin_client.send_message(
+                DEST_CHAT_ID,
+                msg.text or ''
+            )
 
 # ── Gerencia TelethonClient de cada usuário ───────────────────────────────────
 user_clients = {}
@@ -150,17 +163,35 @@ async def ensure_client(uid):
             title = getattr(chat, 'title', None) or str(ev.chat_id)
             header = f"📢 *{title}* (`{ev.chat_id}`)"
             await bot.send_message(DEST_CHAT_ID, header, parse_mode='Markdown')
-            await ev.message.forward_to(DEST_CHAT_ID)
-            # Clonar comentários da thread associada
+
+            # fallback similar para dynamic
+            try:
+                await ev.message.forward_to(DEST_CHAT_ID)
+            except Exception:
+                msg = ev.message
+                if msg.media:
+                    await bot.send_file(
+                        DEST_CHAT_ID,
+                        file=msg.media,
+                        caption=msg.text or ''
+                    )
+                else:
+                    await bot.send_message(DEST_CHAT_ID, msg.text or '')
+
+            # clonar comentários da thread
             try:
                 full = await client(GetFullChannelRequest(channel=ev.chat_id))
-                linked_id = getattr(full.full_chat, 'linked_chat_id', None)
-                if linked_id:
-                    comments = await client.get_messages(linked_id, limit=20)
+                linked = getattr(full.full_chat, 'linked_chat_id', None)
+                if linked:
+                    comments = await client.get_messages(linked, limit=20)
                     for cm in comments:
-                        cm_header = f"💬 Comentário de {title} (`{linked_id}`)"
+                        cm_header = f"💬 Comentário de {title} (`{linked}`)"
                         await bot.send_message(DEST_CHAT_ID, cm_header, parse_mode='Markdown')
-                        await cm.forward_to(DEST_CHAT_ID)
+                        await bot.send_file(
+                            DEST_CHAT_ID,
+                            file=cm.media or b'',
+                            caption=cm.text or ''
+                        )
             except:
                 pass
 
