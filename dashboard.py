@@ -1,28 +1,27 @@
 # dashboard.py
-# Dashboard Streamlit para admin — usa Telethon.sync para não precisar de event loop
+# Dashboard Admin — usa Telethon.sync para não precisar de event loop
 
-import os
-import json
+import os, json
 import streamlit as st
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 
-# ── Configurações via ENV vars ───────────────────────────────────────────────
+# ── ENV VARS ────────────────────────────────────────────────────────────────
 API_ID          = int(os.environ['TELEGRAM_API_ID'])
 API_HASH        = os.environ['TELEGRAM_API_HASH']
 SESSION_STRING  = os.environ['SESSION_STRING']
 SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
-# Exemplo: SOURCE_CHAT_IDS='[-1002460735067,-1002455542600,-1002794084735]'
+# e.g. SOURCE_CHAT_IDS='[-1002460735067,-1002455542600,-1002794084735]'
 
-# ── Inicializa Telethon (modo síncrono) ──────────────────────────────────────
+# ── Inicializa Telethon em modo síncrono ───────────────────────────────────
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 client.start()
 
-# ── Layout do Streamlit ──────────────────────────────────────────────────────
+# ── Layout ──────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Dashboard Admin", layout="wide")
 st.title("📊 Dashboard Admin — Encaminhador")
 
-# ── Seção 1: canais fixos originais ──────────────────────────────────────────
+# ── Canais fixos ───────────────────────────────────────────────────────────
 st.header("Canais Originais (fixos)")
 for gid in SOURCE_CHAT_IDS:
     try:
@@ -34,7 +33,7 @@ for gid in SOURCE_CHAT_IDS:
 
 st.markdown("---")
 
-# ── Seção 2: inscrições de usuários ──────────────────────────────────────────
+# ── Inscrições de usuários ─────────────────────────────────────────────────
 st.header("Inscrições de Usuários")
 subs_file = 'subscriptions.json'
 
@@ -58,7 +57,7 @@ else:
                     name = str(gid)
                 cols[0].markdown(f"• **{name}** — `{gid}`")
                 if cols[1].button("❌", key=f"{uid}-{gid}"):
-                    # remove inscrição e salva
+                    # remove inscrição
                     new_lst = [g for g in lst if g != gid]
                     if new_lst:
                         subs[uid] = new_lst
