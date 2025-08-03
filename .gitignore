@@ -1,14 +1,5 @@
-# Python artifacts
 __pycache__/
-*.py[cod]
-*.egg-info/
 venv/
 .env
-
-# Persistência local
+sessions.json
 subscriptions.json
-
-# Railway
-.DS_Store
-config.py
-cecidilho.py
