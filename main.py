@@ -56,7 +56,7 @@ async def handler(ev):
         await reply(
             "**👋 Bem-vindo ao Encaminhador!**\n\n"
             "🔗 Para gerar sua Session (online):\n"
-            "https://colab.research.google.com/drive/1H3vHoNr_8CGW0rLEV-fFKKINo8mHWr5U?usp=sharing\n\n"
+            "<https://colab.research.google.com/drive/1H3vHoNr_8CGW0rLEV-fFKKINo8uHWr5U?usp=sharing>\n\n"
             "**Fluxo:**\n"
             "1️⃣ `/setsession SUA_SESSION`\n"
             "2️⃣ `/listgroups`\n"
