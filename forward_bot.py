@@ -1,6 +1,8 @@
 # forward_bot.py
 
-import os, ast, asyncio, threading
+import os, ast
+import asyncio
+import threading
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from flask import Flask
@@ -29,21 +31,42 @@ async def start_bot():
 
     @client.on(events.NewMessage(chats=source_ids))
     async def handler(event):
-        msg    = event.message
-        header = f"🚀 {event.chat.title} — {msg.sender.first_name}:\n"
+        msg = event.message
+
+        # Pega o remetente de forma genérica
+        sender = await event.get_sender()
+        if hasattr(sender, 'first_name'):
+            sender_name = sender.first_name
+        elif hasattr(sender, 'title'):
+            sender_name = sender.title
+        else:
+            sender_name = str(msg.sender_id or '')
+
+        header = f"🚀 {event.chat.title} — {sender_name}:\n"
+
+        # Reenvia texto
         if msg.text:
             await client.send_message(dest_chat_id, header + msg.text)
+
+        # Reenvia mídia
         if msg.media:
             path = await msg.download_media()
-            await client.send_file(dest_chat_id, path,
-                                   caption=header + (msg.text or ''))
-            try: os.remove(path)
-            except: pass
+            await client.send_file(
+                dest_chat_id,
+                path,
+                caption=header + (msg.text or '')
+            )
+            try:
+                os.remove(path)
+            except:
+                pass
 
     print("🤖 Bot rodando.")
     await client.run_until_disconnected()
 
 # ---------- Entrada principal ----------
 if __name__ == '__main__':
+    # 1) Sobe o server Flask em background
     threading.Thread(target=run_flask, daemon=True).start()
+    # 2) Sobe o bot
     asyncio.run(start_bot())
