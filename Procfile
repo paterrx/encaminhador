@@ -1,1 +1,1 @@
-web: python forward_bot.py
+web: python bot.py
