@@ -5,7 +5,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from flask import Flask
 
-# ––– HTTP keep-alive server ––––––––––––––––––––––––––––––––––––––––––––––––
+# ——— HTTP keep-alive ———————————————————————————————————————————————————————
 app = Flask('keep_alive')
 
 @app.route('/')
@@ -16,7 +16,7 @@ def run_flask():
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
 
-# ––– Bot Telegram –––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+# ——— Bot Telegram —————————————————————————————————————————————————————————
 async def start_bot():
     api_id       = int(os.environ['TELEGRAM_API_ID'])
     api_hash     = os.environ['TELEGRAM_API_HASH']
@@ -27,10 +27,9 @@ async def start_bot():
     client = TelegramClient(StringSession(session_str), api_id, api_hash)
     await client.start()
 
-    # mapa de (origem_chat_id, origem_msg_id) -> destino_msg_id
+    # Mapeia (origem_chat, origem_msg_id) → destino_msg_id
     forwarded = {}
 
-    # helper para construir o header
     async def make_header(ev):
         sender = await ev.get_sender()
         if hasattr(sender, 'first_name'):
@@ -43,72 +42,83 @@ async def start_bot():
 
     @client.on(events.NewMessage(chats=source_ids))
     async def on_new(ev):
-        msg = ev.message
+        msg    = ev.message
         header = await make_header(ev)
+        sent   = None
 
-        # envia mídia ou texto, mas nunca os dois
+        # Tenta enviar mídia primeiro
         if msg.media:
             path = await msg.download_media()
-            sent = await client.send_file(
-                dest_chat_id,
-                path,
-                caption=header + (msg.text or '')
-            )
-            try: os.remove(path)
-            except: pass
-        else:
+            if path:
+                try:
+                    sent = await client.send_file(
+                        dest_chat_id,
+                        path,
+                        caption=header + (msg.text or '')
+                    )
+                except Exception:
+                    sent = None
+                finally:
+                    try: os.remove(path)
+                    except: pass
+
+        # Se não enviou mídia, tenta texto
+        if not sent and msg.text:
             sent = await client.send_message(
                 dest_chat_id,
-                header + (msg.text or '')
+                header + msg.text
             )
 
-        # guarda o encaminhamento
-        forwarded[(ev.chat_id, msg.id)] = sent.id
+        # Guarda só se realmente enviou
+        if sent:
+            forwarded[(ev.chat_id, msg.id)] = sent.id
 
     @client.on(events.MessageEdited(chats=source_ids))
     async def on_edit(ev):
         msg = ev.message
         key = (ev.chat_id, msg.id)
         if key not in forwarded:
-            return  # não tínhamos encaminhado antes
-
+            return
         dest_msg_id = forwarded[key]
-        header = await make_header(ev)
+        header      = await make_header(ev)
 
-        # Se agora há mídia, apaga o anterior e envia novo
+        # Se agora há mídia, reenvia e atualiza o mapa
         if msg.media:
-            # apaga mensagem antiga
-            try:
-                await client.delete_messages(dest_chat_id, dest_msg_id)
-            except:
-                pass
-            # envia a mídia atualizada
             path = await msg.download_media()
-            sent = await client.send_file(
-                dest_chat_id,
-                path,
-                caption=header + (msg.text or '')
-            )
-            try: os.remove(path)
-            except: pass
-            # atualiza o mapa
-            forwarded[key] = sent.id
+            if path:
+                try:
+                    await client.delete_messages(dest_chat_id, dest_msg_id)
+                except:
+                    pass
+                try:
+                    sent = await client.send_file(
+                        dest_chat_id,
+                        path,
+                        caption=header + (msg.text or '')
+                    )
+                    forwarded[key] = sent.id
+                except:
+                    pass
+                finally:
+                    try: os.remove(path)
+                    except: pass
 
-        # Caso contrário, só edita o texto/caption
+        # Se não há mídia, tenta editar o texto/caption
         else:
             new_text = header + (msg.text or '')
             try:
-                await client.edit_message(dest_chat_id, dest_msg_id, new_text)
+                await client.edit_message(
+                    dest_chat_id,
+                    dest_msg_id,
+                    new_text
+                )
             except:
-                # se falhar (ex: era mídia), podemos ignorar
                 pass
 
     print("🤖 Bot rodando e escutando edições.")
     await client.run_until_disconnected()
 
-# ––– Entrada principal ––––––––––––––––––––––––––––––––––––––––––––––––––––
+# ——— Entrada principal ————————————————————————————————————————————————————
 if __name__ == '__main__':
-    # 1) inicia o HTTP server
     threading.Thread(target=run_flask, daemon=True).start()
-    # 2) inicia o bot
     asyncio.run(start_bot())
