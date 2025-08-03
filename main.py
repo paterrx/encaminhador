@@ -81,11 +81,18 @@ async def handler(ev):
     if not client:
         return await reply("❌ Primeiro use `/setsession SUA_SESSION`.")
 
-    if text == '/listgroups':
+        if text == '/listgroups':
         dialogs = await client.get_dialogs()
-        lines = [f"{d.title or 'Sem título'} — `{d.id}`" for d in dialogs if d.is_group or d.is_channel]
-        await reply("📋 *Seus grupos:*
-" + "\n".join(lines[:50]), parse_mode='Markdown')
+        lines = [
+            f"{d.title or 'Sem título'} — `{d.id}`"
+            for d in dialogs
+            if d.is_group or d.is_channel
+        ]
+        # Monta a mensagem com a lista de canais
+        msg = "📋 *Seus grupos:*
+" + "
+".join(lines[:50])
+        await reply(msg, parse_mode='Markdown')
         return
 
     if text.startswith('/subscribe '):
