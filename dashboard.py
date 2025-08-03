@@ -1,72 +1,60 @@
-# dashboard.py
-# Dashboard Admin — usa Telethon.sync para não precisar de event loop
-
-import os, json
+import os
+import json
 import streamlit as st
-from telethon.sync import TelegramClient
-from telethon.sessions import StringSession
 
-# ── ENV VARS ────────────────────────────────────────────────────────────────
-API_ID          = int(os.environ['TELEGRAM_API_ID'])
-API_HASH        = os.environ['TELEGRAM_API_HASH']
-SESSION_STRING  = os.environ['SESSION_STRING']
-SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
-# e.g. SOURCE_CHAT_IDS='[-1002460735067,-1002455542600,-1002794084735]'
-
-# ── Inicializa Telethon em modo síncrono ───────────────────────────────────
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-client.start()
-
-# ── Layout ──────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Dashboard Admin", layout="wide")
+# ── Configuração ──────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Dashboard Admin – Encaminhador", layout="wide")
 st.title("📊 Dashboard Admin — Encaminhador")
 
-# ── Canais fixos ───────────────────────────────────────────────────────────
-st.header("Canais Originais (fixos)")
-for gid in SOURCE_CHAT_IDS:
-    try:
-        chat = client.get_entity(gid)
-        title = chat.title or chat.username or str(gid)
-    except Exception as e:
-        title = f"<Erro: {e}>"
-    st.write(f"• **{title}** — `{gid}`")
+# IDs iniciais vindos da ENV
+SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
+
+# Carrega inscrições de usuários
+SUBS_FILE = 'subscriptions.json'
+if os.path.exists(SUBS_FILE):
+    with open(SUBS_FILE, 'r', encoding='utf-8') as f:
+        subscriptions = json.load(f)
+else:
+    subscriptions = {}
+
+# Apura só os IDs únicos dinâmicos
+dynamic_ids = sorted({cid for lst in subscriptions.values() for cid in lst})
+
+# ── Seção 1: Canais Iniciais ──────────────────────────────────────────────────
+st.header("🔒 Canais Originais (fixos)")
+if not SOURCE_CHAT_IDS:
+    st.info("Nenhum canal fixo configurado.")
+else:
+    for cid in SOURCE_CHAT_IDS:
+        st.write(f"• `{cid}`")
 
 st.markdown("---")
 
-# ── Inscrições de usuários ─────────────────────────────────────────────────
-st.header("Inscrições de Usuários")
-subs_file = 'subscriptions.json'
-
-if not os.path.exists(subs_file):
-    st.info("Nenhuma inscrição de usuário ainda.")
+# ── Seção 2: Canais Dinâmicos ─────────────────────────────────────────────────
+st.header("✨ Canais Dinâmicos (inscritos pelos usuários)")
+if not dynamic_ids:
+    st.info("Nenhuma inscrição de usuário no momento.")
 else:
-    with open(subs_file, 'r', encoding='utf-8') as f:
-        subs = json.load(f)
+    # multiselect para decidir quais IDs continuam ativos
+    selected = st.multiselect(
+        "Selecione os canais que devem continuar monitorados:",
+        options=dynamic_ids,
+        default=dynamic_ids
+    )
 
-    if not subs:
-        st.info("Nenhuma inscrição de usuário ainda.")
-    else:
-        for uid, lst in subs.items():
-            st.subheader(f"👤 Usuário `{uid}`")
-            for gid in lst:
-                cols = st.columns([8, 1])
-                try:
-                    chat = client.get_entity(gid)
-                    name = chat.title or chat.username or str(gid)
-                except:
-                    name = str(gid)
-                cols[0].markdown(f"• **{name}** — `{gid}`")
-                if cols[1].button("❌", key=f"{uid}-{gid}"):
-                    # remove inscrição
-                    new_lst = [g for g in lst if g != gid]
-                    if new_lst:
-                        subs[uid] = new_lst
-                    else:
-                        subs.pop(uid)
-                    with open(subs_file, 'w', encoding='utf-8') as wf:
-                        json.dump(subs, wf, indent=2)
-                    st.experimental_rerun()
+    if st.button("💾 Salvar alterações"):
+        # filtra subscriptions para manter só os selected
+        new_subs = {}
+        for user_id, lst in subscriptions.items():
+            filtered = [cid for cid in lst if cid in selected]
+            if filtered:
+                new_subs[user_id] = filtered
+
+        # grava de volta
+        with open(SUBS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(new_subs, f, indent=2)
+
+        st.success("Configurações salvas! Atualize a página para ver o resultado.")
 
 st.sidebar.markdown("---")
-if st.sidebar.button("🔄 Recarregar"):
-    st.experimental_rerun()
+st.sidebar.write("Para aplicar mudanças, recarregue (F5) esta página.")
