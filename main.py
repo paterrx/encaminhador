@@ -17,11 +17,11 @@ BOT_TOKEN       = os.environ['BOT_TOKEN']
 DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])
 SESSION_STRING  = os.environ['SESSION_STRING']
 SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
-# Exemplo: SOURCE_CHAT_IDS='[-1002460735067,-1002455542600,-1002794084735]'
 
 # ── Arquivos de persistência ─────────────────────────────────────────────────
-SESS_FILE = 'sessions.json'       # { user_id: session_str, ... }
-SUBS_FILE = 'subscriptions.json'  # { user_id: [group_id, ...], ... }
+SESS_FILE = 'sessions.json'
+SUBS_FILE = 'subscriptions.json'
+
 
 def load(fname):
     try:
@@ -29,6 +29,7 @@ def load(fname):
             return json.load(f)
     except:
         return {}
+
 
 def save(fname, data):
     with open(fname, 'w', encoding='utf-8') as f:
@@ -60,7 +61,8 @@ async def handler(ev):
         await reply(
             "**👋 Bem-vindo ao Encaminhador!**\n\n"
             "🔗 Gere sua Session online (Colab):\n"
-            "<https://colab.research.google.com/drive/1H3vHoNr_8CGW0rLEV-fFKKINo8mHWr5U?usp=sharing>\n\n"
+            "[🔗 Clique aqui para abrir no Colab]"
+            "(https://colab.research.google.com/drive/1H3vHoNr_8CGW0rLEV-fFKKINo8mHWr5U?usp=sharing)\n\n"
             "**Fluxo:**\n"
             "1️⃣ `/setsession SUA_SESSION`\n"
             "2️⃣ `/listgroups`\n"
@@ -89,7 +91,8 @@ async def handler(ev):
         dialogs = await client.get_dialogs()
         lines = [
             f"{d.title or 'Sem título'} — `{d.id}`"
-            for d in dialogs if d.is_group or d.is_channel
+            for d in dialogs
+            if d.is_group or d.is_channel
         ]
         msg = "📋 *Seus grupos:*\n" + "\n".join(lines[:50])
         await reply(msg, parse_mode='Markdown')
@@ -139,7 +142,7 @@ async def forward_initial(ev):
     msg = ev.message
     try:
         await msg.forward_to(DEST_CHAT_ID)
-    except:
+    except Exception:
         if msg.media:
             await admin_client.send_file(DEST_CHAT_ID, msg.media, caption=msg.text or '')
         else:
@@ -170,7 +173,7 @@ async def ensure_client(uid):
             msg = ev.message
             try:
                 await msg.forward_to(DEST_CHAT_ID)
-            except:
+            except Exception:
                 if msg.media:
                     await bot.send_file(DEST_CHAT_ID, msg.media, caption=msg.text or '')
                 else:
