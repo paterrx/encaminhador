@@ -1,11 +1,7 @@
 # main.py
-# Bot de encaminhamento com fallback para grupos sem forward e gerenciamento de sessões
-
-import os
-import json
-import asyncio
-import threading
-from flask import Flask
+# Bot de encaminhamento com fallback manual para grupos sem forward
+import os, json, asyncio, threading
+from flask import Flask, jsonify
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import GetFullChannelRequest
@@ -17,12 +13,10 @@ BOT_TOKEN       = os.environ['BOT_TOKEN']
 DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])
 SESSION_STRING  = os.environ['SESSION_STRING']
 SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
-# Exemplo: SOURCE_CHAT_IDS='[-1002460735067,-1002455542600,-1002794084735]'
 
 # ── Persistência em arquivos ──────────────────────────────────────────────────
-SESS_FILE = 'sessions.json'       # { user_id: session_str, ... }
-SUBS_FILE = 'subscriptions.json'  # { user_id: [group_id, ...], ... }
-
+SESS_FILE = 'sessions.json'
+SUBS_FILE = 'subscriptions.json'
 
 def load(fname):
     try:
@@ -31,7 +25,6 @@ def load(fname):
     except:
         return {}
 
-
 def save(fname, data):
     with open(fname, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2)
@@ -39,13 +32,16 @@ def save(fname, data):
 sessions      = load(SESS_FILE)
 subscriptions = load(SUBS_FILE)
 
-# ── HTTP keep-alive para Railway ──────────────────────────────────────────────
+# ── Flask keep-alive + debug endpoint ──────────────────────────────────────────
 app = Flask('keep_alive')
 
 @app.route('/')
 def home():
     return 'OK'
 
+@app.route('/dump_subs')
+def dump_subs():
+    return jsonify(subscriptions)
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
@@ -55,42 +51,45 @@ bot = TelegramClient('bot_session', API_ID, API_HASH)
 
 @bot.on(events.NewMessage(func=lambda e: e.is_private))
 async def handler(ev):
-    uid   = ev.sender_id
-    text  = ev.raw_text.strip()
-    reply = ev.reply
+    uid, text, reply = ev.sender_id, ev.raw_text.strip(), ev.reply
 
     # /start & /help
     if text in ('/start', '/help'):
         await reply(
             "**👋 Bem-vindo ao Encaminhador!**\n\n"
-            "🔗 Gere sua Session online (Colab):\n"
-            "[🔗 Clique aqui para abrir no Colab]"
+            "🔗 Gere sua Session (Colab):\n"
+            "[🔗 Abrir no Colab]"
             "(https://colab.research.google.com/drive/1H3vHoNr_8CGW0rLEV-fFKKINo8mHWr5U?usp=sharing)\n\n"
             "**Fluxo:**\n"
             "1️⃣ `/setsession SUA_SESSION`\n"
             "2️⃣ `/listgroups`\n"
             "3️⃣ `/subscribe GROUP_ID`\n"
-            "4️⃣ `/unsubscribe GROUP_ID`",
+            "4️⃣ `/unsubscribe GROUP_ID`\n"
+            "📌 Descubra seu ID com `/myid`",
             parse_mode='Markdown'
         )
         return
 
-    # /setsession: armazena a session string
+    # /myid
+    if text == '/myid':
+        await reply(f"🆔 Seu user_id é `{uid}`", parse_mode='Markdown')
+        return
+
+    # /setsession
     if text.startswith('/setsession '):
-        sess = text.split(' ', 1)[1].strip()
-        sessions[str(uid)] = sess
+        s = text.split(' ', 1)[1].strip()
+        sessions[str(uid)] = s
         save(SESS_FILE, sessions)
         await reply("✅ Session salva! Agora use `/listgroups`.")
-        # Tenta validar já agora
         await ensure_client(uid)
         return
 
-    # Garante client do usuário autenticado
+    # Garante client do usuário
     client = await ensure_client(uid)
     if not client:
         return await reply("❌ Primeiro use `/setsession SUA_SESSION`.")
 
-    # /listgroups: lista grupos e canais disponíveis
+    # /listgroups
     if text == '/listgroups':
         dialogs = await client.get_dialogs()
         lines = [
@@ -102,7 +101,7 @@ async def handler(ev):
         await reply(msg, parse_mode='Markdown')
         return
 
-    # /subscribe: adiciona grupo à lista do usuário
+    # /subscribe
     if text.startswith('/subscribe '):
         try:
             gid = int(text.split(' ', 1)[1])
@@ -115,7 +114,7 @@ async def handler(ev):
         save(SUBS_FILE, subscriptions)
         return await reply(f"✅ Inscrito no `{gid}`.")
 
-    # /unsubscribe: remove grupo da lista do usuário
+    # /unsubscribe
     if text.startswith('/unsubscribe '):
         try:
             gid = int(text.split(' ', 1)[1])
@@ -128,59 +127,55 @@ async def handler(ev):
         save(SUBS_FILE, subscriptions)
         return await reply(f"🗑️ Desinscrito do `{gid}`.")
 
-    # Comando não reconhecido
+    # fallback
     await reply("❓ Comando não reconhecido. Use `/help`.", parse_mode='Markdown')
 
-# ── Cliente admin para os canais iniciais ─────────────────────────────────────
+# ── Admin client para canais iniciais ─────────────────────────────────────────
 admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 @admin_client.on(events.NewMessage(chats=SOURCE_CHAT_IDS))
 async def forward_initial(ev):
-    # Cabeçalho de origem
     chat = await admin_client.get_entity(ev.chat_id)
     title = getattr(chat, 'title', None) or str(ev.chat_id)
-    header = f"📢 *{title}* (`{ev.chat_id}`)"
-    await admin_client.send_message(DEST_CHAT_ID, header, parse_mode='Markdown')
-
-    # Tenta forward, senão fallback manual
-    msg = ev.message
+    await admin_client.send_message(
+        DEST_CHAT_ID,
+        f"📢 *{title}* (`{ev.chat_id}`)",
+        parse_mode='Markdown'
+    )
+    m = ev.message
     try:
-        await msg.forward_to(DEST_CHAT_ID)
+        await m.forward_to(DEST_CHAT_ID)
     except Exception:
-        if msg.media:
-            await admin_client.send_file(DEST_CHAT_ID, msg.media, caption=msg.text or '')
+        # fallback manual: download + send
+        if m.media:
+            path = await m.download_media()
+            await admin_client.send_file(DEST_CHAT_ID, path, caption=m.text or '')
         else:
-            await admin_client.send_message(DEST_CHAT_ID, msg.text or '')
+            await admin_client.send_message(DEST_CHAT_ID, m.text or '')
 
-# ── Gerenciamento de sessões de usuários ─────────────────────────────────────
+# ── Gerenciamento de sessions de usuários ─────────────────────────────────────
 user_clients = {}
 
 async def ensure_client(uid):
     key = str(uid)
-    # Retorna client cacheado
     if key in user_clients:
         return user_clients[key]
 
-    # Obtém session string
     sess = sessions.get(key)
     if not isinstance(sess, str) or not sess:
         return None
 
-    # Tenta instanciar o client, captura string inválida
     try:
         client = TelegramClient(StringSession(sess), API_ID, API_HASH)
     except ValueError:
-        # Session corrompida: remove e instrui o usuário
         sessions.pop(key, None)
         save(SESS_FILE, sessions)
         await bot.send_message(
             uid,
-            "🚫 Sua SessionString está inválida ou expirou."
-            " Por favor use novamente `/setsession SUA_SESSION`."
+            "🚫 Session inválida. Use `/setsession SUA_SESSION` novamente."
         )
         return None
 
-    # Se ok, inicia e armazena
     await client.start()
     user_clients[key] = client
 
@@ -188,32 +183,34 @@ async def ensure_client(uid):
     async def forward_user(ev):
         if ev.chat_id not in subscriptions.get(key, []):
             return
-
-        # Cabeçalho
         chat = await client.get_entity(ev.chat_id)
         title = getattr(chat, 'title', None) or str(ev.chat_id)
-        header = f"📢 *{title}* (`{ev.chat_id}`)"
-        await bot.send_message(DEST_CHAT_ID, header, parse_mode='Markdown')
-
-        # Forward ou fallback
-        msg = ev.message
+        await bot.send_message(
+            DEST_CHAT_ID,
+            f"📢 *{title}* (`{ev.chat_id}`)",
+            parse_mode='Markdown'
+        )
+        m = ev.message
         try:
-            await msg.forward_to(DEST_CHAT_ID)
+            await m.forward_to(DEST_CHAT_ID)
         except Exception:
-            if msg.media:
-                await bot.send_file(DEST_CHAT_ID, msg.media, caption=msg.text or '')
+            if m.media:
+                path = await m.download_media()
+                await bot.send_file(DEST_CHAT_ID, path, caption=m.text or '')
             else:
-                await bot.send_message(DEST_CHAT_ID, msg.text or '')
-
-        # Clona comentários da thread vincula
+                await bot.send_message(DEST_CHAT_ID, m.text or '')
+        # clonagem de thread
         try:
             full = await client(GetFullChannelRequest(channel=ev.chat_id))
             linked = getattr(full.full_chat, 'linked_chat_id', None)
             if linked:
-                comments = await client.get_messages(linked, limit=20)
-                for cm in comments:
-                    cm_header = f"💬 Comentário de {title} (`{linked}`)"
-                    await bot.send_message(DEST_CHAT_ID, cm_header, parse_mode='Markdown')
+                cmts = await client.get_messages(linked, limit=20)
+                for cm in cmts:
+                    await bot.send_message(
+                        DEST_CHAT_ID,
+                        f"💬 Comentário de {title} (`{linked}`)",
+                        parse_mode='Markdown'
+                    )
                     if cm.media:
                         await bot.send_file(DEST_CHAT_ID, cm.media, caption=cm.text or '')
                     else:
@@ -221,21 +218,17 @@ async def ensure_client(uid):
         except:
             pass
 
-    # Mantém o client ativo
     asyncio.create_task(client.run_until_disconnected())
     return client
 
-# ── Execução principal ─────────────────────────────────────────────────────────
+# ── Entrada principal ─────────────────────────────────────────────────────────
 async def main():
-    # Inicia Flask
     threading.Thread(target=run_flask, daemon=True).start()
-    # Inicia clients
     await asyncio.gather(
         admin_client.start(),
         bot.start(bot_token=BOT_TOKEN)
     )
     print("🤖 Bots rodando...")
-    # Aguarda desconexão
     await asyncio.gather(
         admin_client.run_until_disconnected(),
         bot.run_until_disconnected()
