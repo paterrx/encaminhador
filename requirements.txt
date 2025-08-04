@@ -1,4 +1,5 @@
-streamlit
-telethon
+telethon==1.40.0
 flask
+streamlit
 nest_asyncio
+requests
