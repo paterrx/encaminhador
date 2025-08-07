@@ -1,249 +1,184 @@
-# main.py
-# Encaminhador ultimate: fallbacks robustos, deduplicação, retry, edição e audit trail
 import os
 import json
-import asyncio
-import threading
 import logging
-from datetime import datetime
-from flask import Flask, jsonify
-from telethon import TelegramClient, events, errors
+import asyncio
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from flask import Flask, jsonify
 
-# ── CONFIGURAÇÃO VIA ENV ───────────────────────────────────────────────────
-API_ID          = int(os.environ['TELEGRAM_API_ID'])
-API_HASH        = os.environ['TELEGRAM_API_HASH']
-BOT_TOKEN       = os.environ['BOT_TOKEN']
-DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])
-SESSION_STRING  = os.environ['SESSION_STRING']
+# ————— Configuração de logging —————
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger("encaminhador")
 
-# IDs puros (sem -100) dos canais fixos
-elem = os.environ.get('SOURCE_CHAT_IDS','[]')
-SOURCE_CHAT_IDS = json.loads(elem)
+# ————— Paths ABSOLUTOS dentro do volume montado em /data —————
+DATA_DIR   = "/data"
+SUBS_FILE  = os.path.join(DATA_DIR, "subscriptions.json")
+AUDIT_FILE = os.path.join(DATA_DIR, "audit.json")
 
-# Admin IDs (int ou lista)
-raw_admins = os.environ.get('ADMIN_IDS','[]')
-try:
-    parsed = json.loads(raw_admins)
-    ADMIN_IDS = {parsed} if isinstance(parsed,int) else set(parsed)
-except:
-    ADMIN_IDS = set()
+# Garante que a pasta /data exista
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# Persistência em volume montado em /data
-DATA_DIR   = '/data'
-SESS_FILE  = os.path.join(DATA_DIR,'sessions.json')
-SUBS_FILE  = os.path.join(DATA_DIR,'subscriptions.json')
-FWDS_FILE  = os.path.join(DATA_DIR,'forwarded.json')  # mapeia orig->dest
-AUDIT_FILE = os.path.join(DATA_DIR,'audit.json')      # log de eventos
+# Inicializa os arquivos se ainda não existirem
+if not os.path.exists(SUBS_FILE):
+    with open(SUBS_FILE, "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    logger.info("Criado empty subscriptions.json")
+if not os.path.exists(AUDIT_FILE):
+    with open(AUDIT_FILE, "w", encoding="utf-8") as f:
+        json.dump([], f)
+    logger.info("Criado empty audit.json")
 
-# ── LOGGING ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger('encaminhador')
+# ————— Carrega variáveis de ambiente —————
+SOURCE_CHAT_IDS = json.loads(os.environ.get("SOURCE_CHAT_IDS", "[]"))
+DEST_CHAT_ID    = int(os.environ["DEST_CHAT_ID"])
+API_ID          = int(os.environ["TELEGRAM_API_ID"])
+API_HASH        = os.environ["TELEGRAM_API_HASH"]
+BOT_TOKEN       = os.environ["BOT_TOKEN"]
+ADMIN_SESSION   = os.environ["SESSION_STRING"]
 
-# ── JSON I/O ─────────────────────────────────────────────────────────────────
-def load(path, default):
-    try:
-        with open(path,'r',encoding='utf-8') as f: return json.load(f)
-    except:
-        return default
+# ————— Flask para keep-alive e endpoints de debug —————
+app = Flask("keep_alive")
 
-def save(path,obj):
-    os.makedirs(os.path.dirname(path),exist_ok=True)
-    with open(path,'w',encoding='utf-8') as f:
-        json.dump(obj,f,indent=2)
+@app.route("/")
+def ping():
+    return "OK"
 
-sessions      = load(SESS_FILE, {})
-subscriptions = load(SUBS_FILE, {})
-forwarded     = load(FWDS_FILE, {})  # {"chat_id:msg_id": dest_msg_id}
-audit_log     = load(AUDIT_FILE, []) # list of events
+@app.route("/dump_subs")
+def dump_subs():
+    with open(SUBS_FILE, "r", encoding="utf-8") as f:
+        return jsonify(json.load(f))
 
-# Deduplicação simples
-from collections import deque
-MAX_CACHE = 1000
-dedup_cache = set()
-dedup_queue = deque()
+@app.route("/dump_audit")
+def dump_audit():
+    with open(AUDIT_FILE, "r", encoding="utf-8") as f:
+        return jsonify(json.load(f))
 
-def is_duplicate(key):
-    if key in dedup_cache:
-        return True
-    dedup_cache.add(key)
-    dedup_queue.append(key)
-    if len(dedup_queue) > MAX_CACHE:
-        old = dedup_queue.popleft()
-        dedup_cache.remove(old)
-    return False
+# ————— Funções auxiliares de I/O —————
+def load_subs():
+    with open(SUBS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# Audit trail
-def record_audit(entry):
-    audit_log.append(entry)
-    save(AUDIT_FILE,audit_log)
+def save_subs(subs):
+    with open(SUBS_FILE, "w", encoding="utf-8") as f:
+        json.dump(subs, f, indent=2)
 
-# ── FLASK KEEP-ALIVE + DUMP_SUBS ─────────────────────────────────────────────
-app = Flask('keep_alive')
-@app.route('/')
-def home(): return 'OK'
-@app.route('/dump_subs')
-def dump_subs(): return jsonify(subscriptions)
-def run_flask():
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)), debug=False)
+def log_audit(entry):
+    audit = []
+    with open(AUDIT_FILE, "r", encoding="utf-8") as f:
+        audit = json.load(f)
+    audit.append(entry)
+    with open(AUDIT_FILE, "w", encoding="utf-8") as f:
+        json.dump(audit, f, indent=2)
 
-# ── BotFather BOT (UI admin e público) ───────────────────────────────────────
-bot = TelegramClient('bot_session', API_ID, API_HASH)
-@bot.on(events.NewMessage(func=lambda e:e.is_private))
-async def ui_handler(ev):
-    uid,txt,reply = ev.sender_id, ev.raw_text.strip(), ev.reply
-    async def retry(fn,*args,**kwargs):
-        for i in range(3):
-            try: return await fn(*args,**kwargs)
-            except errors.FloodWaitError as f:
-                await asyncio.sleep(f.seconds+1)
-            except Exception as e:
-                log.exception(e)
-                await asyncio.sleep(1*(2**i))
-        return None
+# ————— Instancia o client Telethon —————
+bot = TelegramClient(StringSession(ADMIN_SESSION), API_ID, API_HASH)
 
-    # Admin commands
-    if txt.startswith('/admin_set_session '):
-        if uid not in ADMIN_IDS: return await reply('🚫 Sem permissão')
-        _,user_id,sess = txt.split(' ',2)
-        sessions[user_id]=sess; save(SESS_FILE,sessions)
-        await ensure_client(int(user_id))
-        return await reply(f'✅ Sessão `{user_id}` salva e listener ativo')
+# ————— Handlers de comando —————
+@bot.on(events.NewMessage(pattern=r"^/setsession\s+(\S+)$"))
+async def handler_setsession(ev):
+    # neste design a própria session fixa do admin NÃO muda
+    await ev.reply("Este comando não é mais usado — use BotFather para o userbot.")
 
-    if txt.startswith('/admin_subscribe '):
-        if uid not in ADMIN_IDS: return await reply('🚫 Sem permissão')
-        _,user_id,gid = txt.split(' ',2); gid=int(gid)
-        subs = subscriptions.setdefault(user_id,[])
-        if gid in subs: return await reply('⚠️ Já inscrito')
-        subs.append(gid); save(SUBS_FILE,subscriptions)
-        await ensure_client(int(user_id))
-        return await reply(f'✅ `{user_id}` inscrito em `{gid}`')
+@bot.on(events.NewMessage(pattern=r"^/listgroups$"))
+async def handler_list(ev):
+    subs = load_subs()
+    lines = []
+    for uid, gids in subs.items():
+        for gid in gids:
+            lines.append(f"UID {uid} → {gid}")
+    if not lines:
+        await ev.reply("⚠️ Nenhuma inscrição dinâmica.")
+    else:
+        await ev.reply("📋 *Seus grupos:*\n" + "\n".join(lines[:50]), parse_mode="Markdown")
 
-    if txt.startswith('/admin_unsubscribe '):
-        if uid not in ADMIN_IDS: return await reply('🚫 Sem permissão')
-        _,user_id,gid = txt.split(' ',2); gid=int(gid)
-        subs = subscriptions.get(user_id,[])
-        if gid not in subs: return await reply('❌ Não inscrito')
-        subs.remove(gid); save(SUBS_FILE,subscriptions)
-        return await reply(f'🗑️ `{user_id}` desinscrito de `{gid}`')
-
-    # Público
-    if txt in ('/start','/help'):
-        return await reply(
-            "**👋 Bem-vindo!**\n"
-            "1️⃣ `/myid`\n2️⃣ `/setsession SUA_SESSION`\n"
-            "3️⃣ `/listgroups`\n4️⃣ `/subscribe GROUP_ID`\n"
-            "5️⃣ `/unsubscribe GROUP_ID`",
-            parse_mode='Markdown'
-        )
-    if txt=='/myid': return await reply(f'🆔 `{uid}`',parse_mode='Markdown')
-    if txt.startswith('/setsession '):
-        sess=txt.split(' ',1)[1]
-        sessions[str(uid)]=sess; save(SESS_FILE,sessions)
-        await ensure_client(uid)
-        return await reply('✅ Session salva e listener ativo')
-    client = await ensure_client(uid)
-    if not client: return await reply('❌ Use `/setsession` antes')
-    if txt=='/listgroups':
-        dlg=await client.get_dialogs()
-        lines=[f"{d.title or 'Sem título'} — `{d.id}`" for d in dlg if d.is_group or d.is_channel]
-        return await reply('📋 Grupos:\n'+"\n".join(lines[:50]),parse_mode='Markdown')
-    if txt.startswith('/subscribe '):
-        gid=int(txt.split(' ',1)[1]); subs=subscriptions.setdefault(str(uid),[])
-        if gid in subs: return await reply('⚠️ Já inscrito')
-        subs.append(gid); save(SUBS_FILE,subscriptions)
-        await ensure_client(uid)
-        return await reply(f'✅ Inscrito em `{gid}`')
-    if txt.startswith('/unsubscribe '):
-        gid=int(txt.split(' ',1)[1]); subs=subscriptions.get(str(uid),[])
-        if gid not in subs: return await reply('❌ Não inscrito')
-        subs.remove(gid); save(SUBS_FILE,subscriptions)
-        return await reply(f'🗑️ Desinscrito de `{gid}`')
-    return await reply('❓ Comando não reconhecido',parse_mode='Markdown')
-
-# ── HANDLERS FIXOS + EDIT + FALLBACKS + AUDIT ────────────────────────────────
-admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-
-async def process_message(client, ev, is_edit=False, user_key=None):
-    cid = ev.chat_id
-    title = (await client.get_entity(cid)).title or str(cid)
-    key = f"{cid}:{ev.message.id}"
-    if is_duplicate(key) and not is_edit:
-        log.info(f"Skipped duplicate {key}")
+@bot.on(events.NewMessage(pattern=r"^/subscribe\s+(-?\d+)$"))
+async def handler_subscribe(ev):
+    uid = ev.sender_id
+    gid = int(ev.pattern_match.group(1))
+    subs = load_subs()
+    user_list = set(subs.get(str(uid), []))
+    if gid in user_list:
+        await ev.reply(f"⚠️ `{gid}` já estava inscrito.", parse_mode="Markdown")
         return
-    fwd_id = forwarded.get(key)
-    text = ev.message.text or ev.message.message or ''
-    ts = ev.message.date.isoformat()
-    action_chain = [
-        ('forward_to', lambda: ev.message.forward_to(DEST_CHAT_ID)),
-        ('download_send', lambda: client.send_file(DEST_CHAT_ID, ev.message.download_media(), caption=text)),
-        ('send_text', lambda: client.send_message(DEST_CHAT_ID, text))
-    ]
-    # Header only for new messages
-    if not is_edit:
-        await client.send_message(DEST_CHAT_ID, f"📢 *{title}* (`{cid}`)", parse_mode='Markdown')
-    # If edit: try edit_message
-    if is_edit and fwd_id:
+    user_list.add(gid)
+    subs[str(uid)] = list(user_list)
+    save_subs(subs)
+    await ev.reply(f"✅ `{uid}` inscrito em `{gid}`.", parse_mode="Markdown")
+
+@bot.on(events.NewMessage(pattern=r"^/unsubscribe\s+(-?\d+)$"))
+async def handler_unsub(ev):
+    uid = ev.sender_id
+    gid = int(ev.pattern_match.group(1))
+    subs = load_subs()
+    user_list = set(subs.get(str(uid), []))
+    if gid not in user_list:
+        await ev.reply(f"⚠️ `{gid}` não estava inscrito.", parse_mode="Markdown")
+        return
+    user_list.remove(gid)
+    if user_list:
+        subs[str(uid)] = list(user_list)
+    else:
+        del subs[str(uid)]
+    save_subs(subs)
+    await ev.reply(f"✅ `{uid}` desinscrito de `{gid}`.", parse_mode="Markdown")
+
+# ————— Handler principal de forwarding com fallbacks —————
+@bot.on(events.NewMessage(chats=SOURCE_CHAT_IDS))
+async def forward_event(ev):
+    chat_id = ev.chat_id
+    m      = ev.message
+    header = f"🚀 *De:* `{chat_id}`\n"
+
+    # 1) Tentativa de forward puro
+    try:
+        await m.forward_to(DEST_CHAT_ID)
+        log_audit(f"forwarded {m.id} from {chat_id}")
+        return
+    except Exception:
+        pass
+
+    # 2) Tentativa de download+send_file
+    if m.media:
         try:
-            await client.edit_message(DEST_CHAT_ID, fwd_id, text)
-            record_audit({'ts':ts,'cid':cid,'title':title,'mid':ev.message.id,'status':'edited'})
+            path = await m.download_media()
+            await bot.send_file(DEST_CHAT_ID, path, caption=header + (m.text or ""))
+            log_audit(f"downloaded+sent {m.id} from {chat_id}")
             return
-        except Exception as e:
-            log.exception(e)
-    # Try chain
-    for name,fn in action_chain:
+        except Exception:
+            pass
+
+    # 3) Só texto
+    if m.text:
         try:
-            result = await fn()
-            new_id = (result.id if hasattr(result,'id') else result.message_id)
-            forwarded[key] = new_id
-            save(FWDS_FILE, forwarded)
-            record_audit({'ts':ts,'cid':cid,'title':title,'mid':ev.message.id,'status':name})
+            await bot.send_message(DEST_CHAT_ID, header + m.text)
+            log_audit(f"textsent {m.id} from {chat_id}")
             return
-        except Exception as e:
-            log.exception(e)
-            if isinstance(e, errors.FloodWaitError):
-                await asyncio.sleep(e.seconds+1)
-    # All failed
-    await client.send_message(DEST_CHAT_ID, f"❗ Falha ao enviar de {title} (`{cid}`) em {ts}")
-    record_audit({'ts':ts,'cid':cid,'title':title,'mid':ev.message.id,'status':'failure'})
+        except Exception:
+            pass
 
-@admin_client.on(events.NewMessage(chats=SOURCE_CHAT_IDS))
-async def fixed_handler(ev):
-    await process_message(admin_client, ev)
+    # 4) Falha total
+    await bot.send_message(
+        DEST_CHAT_ID,
+        f"❌ Falha ao encaminhar mensagem `{m.id}` de `{chat_id}` às `{m.date}`"
+    )
+    log_audit(f"failed {m.id} from {chat_id}")
 
-@admin_client.on(events.MessageEdited(chats=SOURCE_CHAT_IDS))
-async def fixed_edit(ev):
-    await process_message(admin_client, ev, is_edit=True)
-
-# ── HANDLERS DINÂMICOS (user clients)
-user_clients = {}
-
-async def ensure_client(uid:int):
-    key = str(uid)
-    if key in user_clients:
-        return user_clients[key]
-    sess = sessions.get(key)
-    if not sess: return None
-    cli = TelegramClient(StringSession(sess), API_ID, API_HASH)
-    await cli.start()
-    user_clients[key] = cli
-    @cli.on(events.NewMessage(chats=subscriptions.get(key,[])))
-    async def dyn_msg(ev): await process_message(cli, ev, user_key=key)
-    @cli.on(events.MessageEdited(chats=subscriptions.get(key,[])))
-    async def dyn_edit(ev): await process_message(cli, ev, is_edit=True, user_key=key)
-    asyncio.create_task(cli.run_until_disconnected())
-    return cli
-
-# ── ENTRYPOINT ─────────────────────────────────────────────────────────────
+# ————— Inicia tudo —————
 async def main():
-    threading.Thread(target=run_flask, daemon=True).start()
-    await asyncio.gather(admin_client.start(), bot.start(bot_token=BOT_TOKEN))
-    # Bootstrap users
-    for uid_str in sessions.keys():
-        try: await ensure_client(int(uid_str))
-        except Exception as e: log.exception(e)
-    log.info('🤖 Bots rodando...')
-    await asyncio.gather(admin_client.run_until_disconnected(), bot.run_until_disconnected())
+    # 1) Sobe Flask
+    import threading
+    threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))),
+        daemon=True
+    ).start()
 
-if __name__=='__main__':
+    # 2) Sobe Telethon
+    await bot.start(bot_token=BOT_TOKEN)
+    logger.info("🤖 Bot rodando e Flask keep-alive ativo")
+    await bot.run_until_disconnected()
+
+if __name__ == "__main__":
     asyncio.run(main())
