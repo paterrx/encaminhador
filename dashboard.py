@@ -1,75 +1,74 @@
-import os
-import json
 import streamlit as st
+import os, json
 
-# ─── Paths persistidos em volume Docker (/data) ───────────────────────────────
-DATA_DIR    = '/data'
-SUBS_FILE   = os.path.join(DATA_DIR, 'subscriptions.json')
-AUDIT_FILE  = os.path.join(DATA_DIR, 'audit.json')
+# --- Caminhos fixos dentro do volume montado em /data ---
+DATA_DIR       = "/data"
+CHANNELS_FILE  = os.path.join(DATA_DIR, "channels.json")       # lista de canais fixos (se existir)
+SUBS_FILE      = os.path.join(DATA_DIR, "subscriptions.json")  # inscrições dinâmicas
+AUDIT_FILE     = os.path.join(DATA_DIR, "audit.json")          # histórico de forwarding
 
-# ─── Fixed channels vêm da env SOURCE_CHAT_IDS ───────────────────────────────
-try:
-    FIXED_CHANNELS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
-except json.JSONDecodeError:
-    FIXED_CHANNELS = []
+# --- DEBUG na sidebar ---
+st.sidebar.header("🐞 DEBUG INFO")
+st.sidebar.text(f"DATA_DIR exists? {os.path.exists(DATA_DIR)}")
+if os.path.exists(DATA_DIR):
+    st.sidebar.text(f"DATA_DIR contents: {os.listdir(DATA_DIR)}")
+else:
+    st.sidebar.error("Pasta /data não encontrada!")
 
-# ─── load helpers ─────────────────────────────────────────────────────────────
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
+def try_load(path, desc):
     try:
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
-        return default
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        st.sidebar.success(f"✔️ Carregado {desc}: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+        return data
+    except FileNotFoundError:
+        st.sidebar.warning(f"⚠️ {desc} não existe ({path})")
+    except json.JSONDecodeError as e:
+        st.sidebar.error(f"❌ JSON inválido em {desc}: {e}")
+    except Exception as e:
+        st.sidebar.error(f"❌ Erro lendo {desc}: {e}")
+    return None
 
-# ─── Dados ────────────────────────────────────────────────────────────────────
-subscriptions = load_json(SUBS_FILE, {})  # { user_id_str: [chat_id, ...], ... }
-audit_events  = load_json(AUDIT_FILE, [])
+channels_map = try_load(CHANNELS_FILE, "channels.json")
+subscriptions = try_load(SUBS_FILE, "subscriptions.json")
+audit_trail = try_load(AUDIT_FILE, "audit.json")
 
-# Dinâmicos: união de todos os chat_ids inscritos pelos usuários
-dynamic_set = set()
-for lst in subscriptions.values():
-    for cid in lst:
-        dynamic_set.add(cid)
-DYNAMIC_CHANNELS = sorted(dynamic_set)
-
-# ─── UI ──────────────────────────────────────────────────────────────────────
+# --- Interface principal ---
 st.set_page_config(page_title="Dashboard Admin – Encaminhador", layout="wide")
 st.title("📊 Dashboard Admin — Encaminhador")
 
-# Fixed
+# 1) Canais Originais (fixos) vindos do ENV SOURCE_CHAT_IDS
 st.subheader("🔒 Canais Originais (fixos)")
-if FIXED_CHANNELS:
-    for cid in FIXED_CHANNELS:
+try:
+    raw = os.environ.get("SOURCE_CHAT_IDS", "[]")
+    fixed_ids = json.loads(raw)
+    for cid in fixed_ids:
         st.markdown(f"- `{cid}`")
-else:
-    st.info("Nenhum canal fixo configurado em SOURCE_CHAT_IDS.")
+except Exception as e:
+    st.error(f"Erro parseando SOURCE_CHAT_IDS: {e}")
 
 st.markdown("---")
 
-# Dinâmicos
+# 2) Canais Dinâmicos (inscritos pelos usuários)
 st.subheader("✨ Canais Dinâmicos (inscritos pelos usuários)")
-if DYNAMIC_CHANNELS:
-    for cid in DYNAMIC_CHANNELS:
-        st.markdown(f"- `{cid}`")
+if subscriptions:
+    any_sub = False
+    for uid, gids in subscriptions.items():
+        for gid in gids:
+            st.markdown(f"- `{gid}` (user `{uid}`)")
+            any_sub = True
+    if not any_sub:
+        st.info("Nenhuma inscrição dinâmica no momento.")
 else:
     st.info("Nenhuma inscrição dinâmica no momento.")
 
 st.markdown("---")
 
-# Audit Trail
+# 3) Audit Trail
 st.subheader("📝 Audit Trail (últimos 50 eventos)")
-if not audit_events:
-    st.info("Nenhum evento de forwarding/audit registrado ainda.")
+if audit_trail and isinstance(audit_trail, list) and audit_trail:
+    for ev in audit_trail[-50:]:
+        st.markdown(f"- `{ev}`")
 else:
-    # Só exibimos três campos pra resumir: hora, chat_id, status
-    display = []
-    for ev in audit_events[-50:]:
-        ts = ev.get("ts", "")[:19].replace("T", " ")
-        display.append({
-            "Hora"    : ts,
-            "Chat ID" : ev.get("cid", ""),
-            "Status"  : ev.get("status", "")
-        })
-    st.table(display)
+    st.info("Nenhum evento de forwarding/audit registrado ainda.")
+    
