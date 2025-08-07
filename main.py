@@ -1,21 +1,19 @@
-import os
-import json
-import asyncio
-import threading
-import logging
-from typing import Set, Dict, List
+# main.py
+import os, json, asyncio, threading, logging
+from typing import Dict, List, Set
 
 from flask import Flask, jsonify
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
-from telethon.tl import functions, types  # para resolver chat vinculado
+from telethon.tl import functions, types
+from telethon.utils import get_peer_id
 
 # ── ENV ──────────────────────────────────────────────────────────────────────
 API_ID          = int(os.environ['TELEGRAM_API_ID'])
 API_HASH        = os.environ['TELEGRAM_API_HASH']
 BOT_TOKEN       = os.environ['BOT_TOKEN']
 DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])
-SESSION_STRING  = os.environ['SESSION_STRING']           # session do admin (canais fixos)
+SESSION_STRING  = os.environ['SESSION_STRING']           # sua sessão admin (fixos)
 SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS','[]'))
 
 _raw_admins = os.environ.get('ADMIN_IDS','[]')
@@ -25,9 +23,10 @@ try:
 except:
     ADMIN_IDS = set()
 
-DATA_DIR  = '/data'
-SESS_FILE = os.path.join(DATA_DIR, 'sessions.json')      # { user_id: session_string }
-SUBS_FILE = os.path.join(DATA_DIR, 'subscriptions.json') # { user_id: [base_ids...] }
+DATA_DIR   = '/data'
+SESS_FILE  = os.path.join(DATA_DIR, 'sessions.json')       # { "uid": "StringSession" }
+SUBS_FILE  = os.path.join(DATA_DIR, 'subscriptions.json')  # { "uid": [group_ids...] }
+STATE_FILE = os.path.join(DATA_DIR, 'state.json')          # { "last": {uid: {chat_id: msg_id}} }
 
 # ── LOG ──────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -44,10 +43,18 @@ def load_file(path, default):
 def save_file(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path,'w',encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-sessions: Dict[str, str]       = load_file(SESS_FILE, {})
-subscriptions: Dict[str, List[int]] = load_file(SUBS_FILE, {})
+sessions: Dict[str,str]            = load_file(SESS_FILE, {})
+subscriptions: Dict[str,List[int]] = load_file(SUBS_FILE, {})
+state                              = load_file(STATE_FILE, {'last': {}})
+
+def get_last(uid: str, chat_id: int) -> int:
+    return int(state.get('last', {}).get(uid, {}).get(str(chat_id), 0))
+
+def set_last(uid: str, chat_id: int, msg_id: int):
+    state.setdefault('last', {}).setdefault(uid, {})[str(chat_id)] = int(msg_id)
+    save_file(STATE_FILE, state)
 
 # ── FLASK ────────────────────────────────────────────────────────────────────
 app = Flask('keep_alive')
@@ -61,60 +68,183 @@ def dump_subs(): return jsonify(subscriptions)
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)), debug=False)
 
-# ── BOT (BotFather) ─────────────────────────────────────────────────────────
-bot = TelegramClient('bot_session', API_ID, API_HASH)
+# ── CLIENTES ─────────────────────────────────────────────────────────────────
+bot          = TelegramClient('bot_session', API_ID, API_HASH)                 # envia p/ DEST
+admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) # lê fixos
 
-# Cache de “IDs expandidos” por usuário:
-# ex.: {'6209...': { base_id: {base_id, linked_id}, ... }}
-LINK_CACHE: Dict[str, Dict[int, Set[int]]] = {}
+user_clients: Dict[str, TelegramClient] = {}   # uid -> client
+LINK_CACHE: Dict[str, Dict[int, Set[int]]] = {} # uid -> {base_id: {base_id, linked?}}
 
+# ── EXPANSÃO E CHECKS ────────────────────────────────────────────────────────
 async def expand_ids_for_user(cli: TelegramClient, uid_key: str, base_id: int) -> Set[int]:
-    """
-    Para um base_id (canal ou chat), retorna um set com o próprio base_id
-    e o ID do chat vinculado (discussion) se existir.
-    Usa cache em LINK_CACHE[uid_key][base_id].
-    """
-    # cache hit
-    user_cache = LINK_CACHE.setdefault(uid_key, {})
-    if base_id in user_cache:
-        return set(user_cache[base_id])
+    cache = LINK_CACHE.setdefault(uid_key, {})
+    if base_id in cache:
+        return set(cache[base_id])
 
     expanded: Set[int] = {base_id}
     try:
-        entity = await cli.get_entity(base_id)
-        if isinstance(entity, (types.Channel, types.Chat)):
-            # Para canais, tentar pegar o FullChannel e ver linked_chat_id
-            if isinstance(entity, types.Channel):
-                full = await cli(functions.channels.GetFullChannel(channel=entity))
-                linked = getattr(full.full_chat, 'linked_chat_id', None)
-                if linked:
-                    expanded.add(-100 * 10**10 + linked if linked > 0 and linked < 10**10 else linked)
-                    # obs: normalmente linked_chat_id já vem no formato -100..., então só add
-            # Para supergrupos (megagroup), às vezes estão como Channel também (megagroup=True)
-            # Se fosse um Chat normal (raríssimo p/ grandes), não há “linked” via API.
-
+        ent = await cli.get_entity(base_id)
+        if isinstance(ent, types.Channel):
+            # Telethon 1.40.x: use GetFullChannelRequest
+            full = await cli(functions.channels.GetFullChannelRequest(channel=ent))
+            linked = getattr(full.full_chat, 'linked_chat_id', None)
+            if linked:
+                expanded.add(linked)
     except Exception as e:
-        log.info(f"[expand] uid={uid_key} base_id={base_id} sem info de vinculo ({type(e).__name__})")
+        log.info(f"[expand] uid={uid_key} base={base_id} sem vinculo ({type(e).__name__})")
 
-    user_cache[base_id] = expanded
+    cache[base_id] = expanded
     return expanded
 
 async def compute_allowed_ids(cli: TelegramClient, uid_key: str) -> Set[int]:
-    """
-    Soma todos os IDs base inscritos + seus vinculados (expand).
-    """
     allowed: Set[int] = set()
-    base_list = subscriptions.get(uid_key, [])
-    for base_id in base_list:
-        ids = await expand_ids_for_user(cli, uid_key, base_id)
-        allowed.update(ids)
+    for base_id in subscriptions.get(uid_key, []):
+        allowed |= await expand_ids_for_user(cli, uid_key, base_id)
     return allowed
 
+async def check_access_and_warn(cli: TelegramClient, uid_key: str, base_id: int):
+    try:
+        ent = await cli.get_entity(base_id)
+        if isinstance(ent, types.Channel):
+            # força “conversa” e valida acesso
+            await cli(functions.channels.GetFullChannelRequest(channel=ent))
+    except errors.ChannelPrivateError:
+        await bot.send_message(DEST_CHAT_ID, f"⚠️ user `{uid_key}`: canal `{base_id}` é privado (sem acesso).", parse_mode='Markdown')
+    except errors.ChannelInvalidError:
+        await bot.send_message(DEST_CHAT_ID, f"⚠️ user `{uid_key}`: canal `{base_id}` inválido.", parse_mode='Markdown')
+    except Exception as e:
+        log.info(f"[access] uid={uid_key} base={base_id} -> {type(e).__name__}")
+
+# ── ENCAMINHAMENTO ──────────────────────────────────────────────────────────
+async def forward_with_fallback(send_client: TelegramClient, msg, header: str):
+    # cabeçalho
+    await send_client.send_message(DEST_CHAT_ID, header, parse_mode='Markdown')
+    # tenta forward (usa o client do msg internamente)
+    try:
+        await msg.forward_to(DEST_CHAT_ID)
+        return
+    except errors.FloodWaitError as e:
+        await asyncio.sleep(e.seconds+1)
+    except Exception as e:
+        log.info(f"[forward] {type(e).__name__} -> tentando reenvio bruto")
+
+    # download + reenvio
+    try:
+        if msg.media:
+            path = await msg.download_media()
+            await send_client.send_file(DEST_CHAT_ID, path, caption=(msg.text or ''))
+        else:
+            await send_client.send_message(DEST_CHAT_ID, msg.text or '')
+    except errors.FloodWaitError as e:
+        await asyncio.sleep(e.seconds+1)
+    except Exception as e:
+        log.exception(e)
+
+# ── POLLER (varredura proativa) ─────────────────────────────────────────────
+async def poller(cli: TelegramClient, uid_key: str):
+    while True:
+        try:
+            allowed = await compute_allowed_ids(cli, uid_key)
+            base_allowed = set(subscriptions.get(uid_key, []))
+            targets = set(allowed) | base_allowed  # sempre varre o canal base
+
+            for chat_id in targets:
+                last = get_last(uid_key, chat_id)
+                msgs = await cli.get_messages(chat_id, limit=5)
+                for m in reversed(msgs or []):
+                    if not m.id or m.id <= last:
+                        continue
+
+                    # (A) ok se chat_id é permitido
+                    ok = chat_id in allowed
+
+                    # (B) ok se for forward cuja origem é o canal inscrito
+                    if not ok and m.fwd_from and isinstance(m.fwd_from.from_id, types.PeerChannel):
+                        try:
+                            src = get_peer_id(m.fwd_from.from_id)
+                            if src in base_allowed:
+                                ok = True
+                                log.info(f"✅ [poll-accept-fwd] user={uid_key} chat={chat_id} <- base={src}")
+                        except Exception:
+                            pass
+
+                    if not ok:
+                        continue
+
+                    title_ent = await cli.get_entity(chat_id)
+                    title = getattr(title_ent, 'title', None) or str(chat_id)
+                    await forward_with_fallback(bot, m, f"📢 *{title}* (`{chat_id}`)")
+                    set_last(uid_key, chat_id, m.id)
+
+        except Exception as e:
+            log.info(f"[poller] user={uid_key} erro {type(e).__name__}")
+        await asyncio.sleep(30)
+
+# ── DINÂMICOS ────────────────────────────────────────────────────────────────
+async def ensure_client(uid: int):
+    key = str(uid)
+    sess = sessions.get(key)
+    if not sess:
+        return None
+    if key in user_clients:
+        return user_clients[key]
+
+    cli = TelegramClient(StringSession(sess), API_ID, API_HASH)
+    await cli.start()
+    user_clients[key] = cli
+
+    # força “conversa” e valida acesso ao base
+    for base in subscriptions.get(key, []):
+        asyncio.create_task(check_access_and_warn(cli, key, base))
+
+    @cli.on(events.NewMessage)
+    async def forward_user(ev):
+        # dedup
+        if ev.message and ev.message.id:
+            last = get_last(key, ev.chat_id)
+            if ev.message.id <= last:
+                return
+
+        log.info(f"🔍 [dynamic] user={key} got message from chat={ev.chat_id}")
+
+        # allowed por expansão
+        try:
+            allowed = await compute_allowed_ids(cli, key)
+        except Exception:
+            allowed = set(subscriptions.get(key, []))
+
+        base_allowed = set(subscriptions.get(key, []))
+        ok = ev.chat_id in allowed
+
+        # fallback: forward cuja origem é o canal base
+        if not ok and ev.message.fwd_from and isinstance(ev.message.fwd_from.from_id, types.PeerChannel):
+            try:
+                src = get_peer_id(ev.message.fwd_from.from_id)
+                if src in base_allowed:
+                    ok = True
+                    log.info(f"✅ [dyn-accept-fwd] user={key} chat={ev.chat_id} <- base={src}")
+            except Exception:
+                pass
+
+        if not ok:
+            log.info(f"⛔ [dynamic-skip] user={key} chat={ev.chat_id} not in allowed={sorted(allowed)} base={sorted(base_allowed)}")
+            return
+
+        chat  = await cli.get_entity(ev.chat_id)
+        title = getattr(chat, 'title', None) or str(ev.chat_id)
+        await forward_with_fallback(bot, ev.message, f"📢 *{title}* (`{ev.chat_id}`)")
+        if ev.message and ev.message.id:
+            set_last(key, ev.chat_id, ev.message.id)
+
+    asyncio.create_task(poller(cli, key))
+    asyncio.create_task(cli.run_until_disconnected())
+    return cli
+
+# ── UI BOT (comandos) ───────────────────────────────────────────────────────
 @bot.on(events.NewMessage(func=lambda e: e.is_private))
 async def ui_handler(ev):
     uid, txt, reply = ev.sender_id, ev.raw_text.strip(), ev.reply
 
-    # --- ADMIN SET SESSION ---
     if txt.startswith('/admin_set_session '):
         if uid not in ADMIN_IDS:
             return await reply('🚫 Sem permissão.')
@@ -123,12 +253,11 @@ async def ui_handler(ev):
             sessions[user_id] = sess
             save_file(SESS_FILE, sessions)
             await reply(f'✅ Session de `{user_id}` registrada.')
-            await ensure_client(int(user_id))  # sobe listener já
+            await ensure_client(int(user_id))
         except:
             return await reply('❌ Uso: `/admin_set_session USER_ID SESSION`')
         return
 
-    # --- ADMIN SUBSCRIBE ---
     if txt.startswith('/admin_subscribe '):
         if uid not in ADMIN_IDS:
             return await reply('🚫 Sem permissão.')
@@ -142,13 +271,13 @@ async def ui_handler(ev):
                 lst.append(gid)
                 save_file(SUBS_FILE, subscriptions)
                 await reply(f'✅ `{user_id}` inscrito em `{gid}`.')
-                # Recalcular link-cache na próxima mensagem automaticamente.
+                LINK_CACHE.pop(user_id, None)
                 await ensure_client(int(user_id))
+                asyncio.create_task(check_access_and_warn(user_clients[user_id], user_id, gid))
         except:
             return await reply('❌ Uso: `/admin_subscribe USER_ID GROUP_ID`')
         return
 
-    # --- ADMIN UNSUBSCRIBE ---
     if txt.startswith('/admin_unsubscribe '):
         if uid not in ADMIN_IDS:
             return await reply('🚫 Sem permissão.')
@@ -161,7 +290,6 @@ async def ui_handler(ev):
             else:
                 lst.remove(gid)
                 save_file(SUBS_FILE, subscriptions)
-                # Limpa cache expandido desse base_id
                 if user_id in LINK_CACHE and gid in LINK_CACHE[user_id]:
                     LINK_CACHE[user_id].pop(gid, None)
                 await reply(f'🗑️ `{user_id}` desinscrito de `{gid}`.')
@@ -169,7 +297,37 @@ async def ui_handler(ev):
             return await reply('❌ Uso: `/admin_unsubscribe USER_ID GROUP_ID`')
         return
 
-    # --- HELP / START ---
+    if txt.startswith('/admin_probe '):
+        if uid not in ADMIN_IDS:
+            return await reply('🚫 Sem permissão.')
+        try:
+            _, user_id, gid_s = txt.split(' ',2)
+            gid = int(gid_s)
+            cli = await ensure_client(int(user_id))
+            if not cli:
+                return await reply('❌ Session ausente/inválida.')
+            out = [f"[PROBE] uid={user_id} gid={gid}"]
+            try:
+                ent = await cli.get_entity(gid)
+                out.append(f"- type: {type(ent).__name__}, title: {getattr(ent,'title',None)}")
+                if isinstance(ent, types.Channel):
+                    full = await cli(functions.channels.GetFullChannelRequest(channel=ent))
+                    linked = getattr(full.full_chat, 'linked_chat_id', None)
+                    out.append(f"- broadcast={ent.broadcast} megagroup={ent.megagroup} linked={linked}")
+            except Exception as e:
+                out.append(f"- get_entity/full: {type(e).__name__}")
+
+            try:
+                msgs = await cli.get_messages(gid, limit=3)
+                out.append(f"- last_msgs: {[m.id for m in msgs]}")
+            except Exception as e:
+                out.append(f"- get_messages: {type(e).__name__}")
+
+            await bot.send_message(DEST_CHAT_ID, "```\n" + "\n".join(out) + "\n```", parse_mode='Markdown')
+            return await reply('✅ Probe enviado.')
+        except:
+            return await reply('❌ Uso: `/admin_probe USER_ID GROUP_ID`')
+
     if txt in ('/start','/help'):
         return await reply(
             "👋 *Bem-vindo ao Encaminhador!*\n\n"
@@ -178,7 +336,7 @@ async def ui_handler(ev):
             "3️⃣ `/listgroups`\n"
             "4️⃣ `/subscribe GROUP_ID`\n"
             "5️⃣ `/unsubscribe GROUP_ID`\n\n"
-            "⚙️ Admin: `/admin_set_session`, `/admin_subscribe`, `/admin_unsubscribe`",
+            "⚙️ Admin: `/admin_set_session`, `/admin_subscribe`, `/admin_unsubscribe`, `/admin_probe`",
             parse_mode='Markdown'
         )
 
@@ -193,19 +351,17 @@ async def ui_handler(ev):
         await ensure_client(uid)
         return
 
-    # Garantir client do usuário comum
-    client = await ensure_client(uid)
-    if not client:
+    cli = await ensure_client(uid)
+    if not cli:
         return await reply('❌ Use `/setsession SUA_SESSION` antes.')
 
     if txt == '/listgroups':
-        diags = await client.get_dialogs()
+        diags = await cli.get_dialogs()
         lines = []
         for d in diags:
             if getattr(d.entity, 'megagroup', False) or getattr(d.entity, 'broadcast', False):
                 lines.append(f"- `{d.id}` — {d.title or 'Sem título'}")
-        payload = "📋 *Seus grupos:*\n" + "\n".join(lines[:50])
-        return await reply(payload, parse_mode='Markdown')
+        return await reply("📋 *Seus grupos:*\n" + "\n".join(lines[:50]), parse_mode='Markdown')
 
     if txt.startswith('/subscribe '):
         try:
@@ -218,10 +374,10 @@ async def ui_handler(ev):
             return await reply('⚠️ Já inscrito.')
         lst.append(gid)
         save_file(SUBS_FILE, subscriptions)
-        # limpa cache pro usuário para recalcular expandidos
         LINK_CACHE.pop(key, None)
         await reply(f'✅ Inscrito em `{gid}`.')
         await ensure_client(uid)
+        asyncio.create_task(check_access_and_warn(user_clients[key], key, gid))
         return
 
     if txt.startswith('/unsubscribe '):
@@ -241,119 +397,31 @@ async def ui_handler(ev):
 
     return await reply('❓ Comando não reconhecido. `/help`.', parse_mode='Markdown')
 
-# ── ADMIN (fixos) ────────────────────────────────────────────────────────────
-admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-
+# ── FIXOS ────────────────────────────────────────────────────────────────────
 @admin_client.on(events.NewMessage)
-async def forward_initial(ev):
+async def forward_fixed(ev):
     cid = ev.chat_id
     log.info(f"🔍 [fixed] got message in fixed chat={cid}")
     if cid not in SOURCE_CHAT_IDS:
         return
-
-    m     = ev.message
     chat  = await admin_client.get_entity(cid)
     title = getattr(chat, 'title', None) or str(cid)
-
-    await admin_client.send_message(
-        DEST_CHAT_ID, f"🏷️ *{title}* (`{cid}`)", parse_mode='Markdown'
-    )
-
-    try:
-        await m.forward_to(DEST_CHAT_ID)
-        return
-    except errors.FloodWaitError as e:
-        await asyncio.sleep(e.seconds+1)
-    except Exception as e:
-        log.exception(e)
-
-    try:
-        if m.media:
-            path = await m.download_media()
-            await admin_client.send_file(DEST_CHAT_ID, path, caption=m.text or '')
-        else:
-            await admin_client.send_message(DEST_CHAT_ID, m.text or '')
-    except errors.FloodWaitError as e:
-        await asyncio.sleep(e.seconds+1)
-    except Exception as e:
-        log.exception(e)
-
-# ── DINÂMICOS ────────────────────────────────────────────────────────────────
-user_clients: Dict[str, TelegramClient] = {}
-
-async def ensure_client(uid: int):
-    key = str(uid)
-    sess = sessions.get(key)
-    if not sess:
-        return None
-    if key in user_clients:
-        return user_clients[key]
-
-    cli = TelegramClient(StringSession(sess), API_ID, API_HASH)
-    await cli.start()
-    user_clients[key] = cli
-
-    @cli.on(events.NewMessage)
-    async def forward_user(ev):
-        # Log de tudo que chega nessa session:
-        log.info(f"🔍 [dynamic] user={key} got message from chat={ev.chat_id}")
-
-        # Conjunto de IDs permitidos (base + vinculados)
-        try:
-            allowed = await compute_allowed_ids(cli, key)
-        except Exception as e:
-            log.exception(f"[dynamic] compute_allowed_ids falhou (user={key})")
-            allowed = set(subscriptions.get(key, []))  # fallback simples
-
-        if ev.chat_id not in allowed:
-            log.info(f"⛔ [dynamic-skip] user={key} chat={ev.chat_id} not in allowed={sorted(allowed)}")
-            return
-
-        m     = ev.message
-        chat  = await cli.get_entity(ev.chat_id)
-        title = getattr(chat, 'title', None) or str(ev.chat_id)
-
-        await bot.send_message(DEST_CHAT_ID, f"📢 *{title}* (`{ev.chat_id}`)", parse_mode='Markdown')
-
-        try:
-            await m.forward_to(DEST_CHAT_ID)
-            return
-        except errors.FloodWaitError as e:
-            await asyncio.sleep(e.seconds+1)
-        except Exception as e:
-            log.exception(e)
-
-        try:
-            if m.media:
-                path = await m.download_media()
-                await bot.send_file(DEST_CHAT_ID, path, caption=m.text or '')
-            else:
-                await bot.send_message(DEST_CHAT_ID, m.text or '')
-        except errors.FloodWaitError as e:
-            await asyncio.sleep(e.seconds+1)
-        except Exception as e:
-            log.exception(e)
-
-    asyncio.create_task(cli.run_until_disconnected())
-    return cli
+    await forward_with_fallback(admin_client, ev.message, f"🏷️ *{title}* (`{cid}`)")
 
 # ── ENTRYPOINT ───────────────────────────────────────────────────────────────
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
-
     await asyncio.gather(
         admin_client.start(),
         bot.start(bot_token=BOT_TOKEN)
     )
-
-    # Sobe listeners de TODO mundo conhecido (sessions + subscriptions)
+    # sobe todos os conhecidos
     for uid_str in set(list(sessions.keys()) + list(subscriptions.keys())):
         try:
             await ensure_client(int(uid_str))
         except Exception:
             log.exception(f"falha ao iniciar listener {uid_str}")
-
-    log.info('🤖 Bots rodando...')
+    log.info("🤖 Bots rodando...")
     await asyncio.gather(
         admin_client.run_until_disconnected(),
         bot.run_until_disconnected()
