@@ -1,20 +1,20 @@
 import os, json, streamlit as st
 
 DATA_DIR   = "/data"
-SUBS_FILE  = os.path.join(DATA_DIR, "subscriptions.json")
-AUDIT_FILE = os.path.join(DATA_DIR, "audit.json")
+SUBS_FILE  = os.path.join(DATA_DIR,"subscriptions.json")
+AUDIT_FILE = os.path.join(DATA_DIR,"audit.json")
 
-def load_or_empty(path, dtype):
+def load_or_empty(path,dtype):
     try:
-        return json.load(open(path, "r", encoding="utf-8"))
+        return json.load(open(path,"r",encoding="utf-8"))
     except:
         return dtype()
 
 subscriptions = load_or_empty(SUBS_FILE, dict)
-audit_events  = load_or_empty(AUDIT_FILE, list)
-fixed_ids     = json.loads(os.environ.get("SOURCE_CHAT_IDS","[]"))
+audit_events   = load_or_empty(AUDIT_FILE, list)
+fixed_ids      = json.loads(os.environ.get("SOURCE_CHAT_IDS","[]"))
 
-st.set_page_config(page_title="Dashboard — Encaminhador", layout="wide")
+st.set_page_config(page_title="Dashboard Admin — Encaminhador", layout="wide")
 st.title("📊 Dashboard Admin — Encaminhador")
 
 st.subheader("🔒 Canais Fixos")
@@ -25,10 +25,10 @@ else:
     st.info("Nenhum canal fixo.")
 
 st.markdown("---")
-st.subheader("✨ Canais Dinâmicos")
+st.subheader("✨ Canais Dinâmicos (inscritos pelos usuários)")
 if subscriptions:
-    for uid, gids in subscriptions.items():
-        st.markdown(f"👤 `{uid}` → " + ", ".join(f"`{g}`" for g in gids))
+    for uid, lst in subscriptions.items():
+        st.markdown(f"👤 `{uid}` → " + ", ".join(f"`{g}`" for g in lst))
 else:
     st.info("Nenhuma inscrição dinâmica.")
 
