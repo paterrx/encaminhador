@@ -1,44 +1,66 @@
-import os, json, streamlit as st
+import os
+import json
+import requests
+import streamlit as st
 
-DATA_DIR   = "/data"
-SUBS_FILE  = os.path.join(DATA_DIR,"subscriptions.json")
-AUDIT_FILE = os.path.join(DATA_DIR,"audit.json")
+# URL do seu serviço Flask (verifique WORKER_URL em Vars do Railway)
+WEB_URL = os.environ.get('WORKER_URL', 'http://localhost:5000')
+REQUEST_TIMEOUT = 5  # segundos
 
-def load_or_empty(path,dtype):
-    try:
-        return json.load(open(path,"r",encoding="utf-8"))
-    except:
-        return dtype()
+# --- Carrega inscrições dinâmicas via API Flask ---
+try:
+    resp = requests.get(f"{WEB_URL}/dump_subs", timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    SUBS = resp.json()
+except Exception:
+    SUBS = {}
 
-subscriptions = load_or_empty(SUBS_FILE, dict)
-audit_events   = load_or_empty(AUDIT_FILE, list)
-fixed_ids      = json.loads(os.environ.get("SOURCE_CHAT_IDS","[]"))
+# --- Carrega audit trail via API Flask ---
+try:
+    resp = requests.get(f"{WEB_URL}/dump_audit", timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    AUDIT = resp.json()
+except Exception:
+    AUDIT = []
 
-st.set_page_config(page_title="Dashboard Admin — Encaminhador", layout="wide")
-st.title("📊 Dashboard Admin — Encaminhador")
+# --- Canais fixos da ENV ---
+try:
+    FIXED = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
+except json.JSONDecodeError:
+    FIXED = []
 
-st.subheader("🔒 Canais Fixos")
-if fixed_ids:
-    for c in fixed_ids:
-        st.markdown(f"- `{c}`")
-else:
+# --- UI Streamlit ---
+st.set_page_config(
+    page_title="Dashboard Admin — Encaminhador",
+    layout="wide"
+)
+st.title("🚀 Dashboard Admin — Encaminhador")
+
+st.header("🔒 Canais Fixos")
+if not FIXED:
     st.info("Nenhum canal fixo.")
+else:
+    for cid in FIXED:
+        st.write(f"- `{cid}`")
 
 st.markdown("---")
-st.subheader("✨ Canais Dinâmicos (inscritos pelos usuários)")
-if subscriptions:
-    for uid, lst in subscriptions.items():
-        st.markdown(f"👤 `{uid}` → " + ", ".join(f"`{g}`" for g in lst))
+st.header("✨ Canais Dinâmicos (inscritos pelos usuários)")
+dynamic_ids = sorted({g for lst in SUBS.values() for g in lst})
+if not dynamic_ids:
+    st.info("Nenhuma inscrição dinâmica no momento.")
 else:
-    st.info("Nenhuma inscrição dinâmica.")
+    for cid in dynamic_ids:
+        st.write(f"- `{cid}`")
 
 st.markdown("---")
-st.subheader("📝 Audit Trail (últimos 50 eventos)")
-if audit_events:
-    for ev in audit_events[-50:]:
-        t = ev.get("time","")
-        c = ev.get("chat_id","")
-        s = ev.get("status","")
-        st.markdown(f"- `{t}` | chat `{c}` → {s}")
-else:
+st.header("📋 Audit Trail (últimos 50 eventos)")
+if not AUDIT:
     st.info("Nenhum evento registrado ainda.")
+else:
+    # exibe apenas os últimos 50
+    for ev in AUDIT[-50:]:
+        timestamp = ev.get('when', '')
+        tipo      = ev.get('type', '')
+        cid       = ev.get('cid', '')
+        status    = ev.get('ok', '')
+        st.write(f"- {timestamp} · **{tipo}** · `{cid}` · `{status}`")
