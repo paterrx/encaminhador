@@ -13,7 +13,7 @@ API_ID          = int(os.environ['TELEGRAM_API_ID'])
 API_HASH        = os.environ['TELEGRAM_API_HASH']
 BOT_TOKEN       = os.environ['BOT_TOKEN']
 DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])
-SESSION_STRING  = os.environ['SESSION_STRING']           # sua sessão admin (fixos)
+SESSION_STRING  = os.environ['SESSION_STRING']           # sessão admin (fixos)
 SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS','[]'))
 
 _raw_admins = os.environ.get('ADMIN_IDS','[]')
@@ -65,6 +65,14 @@ def home(): return 'OK'
 @app.route('/dump_subs')
 def dump_subs(): return jsonify(subscriptions)
 
+@app.route('/dump_allowed/<uid>')
+async def dump_allowed(uid: str):
+    cli = user_clients.get(uid)
+    if not cli:
+        return jsonify({"error": "no client"}), 404
+    ids = sorted(list(await compute_allowed_ids(cli, uid)))
+    return jsonify({"uid": uid, "allowed": ids})
+
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)), debug=False)
 
@@ -73,10 +81,14 @@ bot          = TelegramClient('bot_session', API_ID, API_HASH)                 #
 admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) # lê fixos
 
 user_clients: Dict[str, TelegramClient] = {}   # uid -> client
-LINK_CACHE: Dict[str, Dict[int, Set[int]]] = {} # uid -> {base_id: {base_id, linked?}}
+LINK_CACHE: Dict[str, Dict[int, Set[int]]] = {} # uid -> {base_id: {base_id, linked_full}}
 
 # ── EXPANSÃO E CHECKS ────────────────────────────────────────────────────────
 async def expand_ids_for_user(cli: TelegramClient, uid_key: str, base_id: int) -> Set[int]:
+    """
+    Retorna o conjunto de IDs permitidos para esse base_id, incluindo o chat
+    de discussão vinculado (convertido corretamente para peer id longo).
+    """
     cache = LINK_CACHE.setdefault(uid_key, {})
     if base_id in cache:
         return set(cache[base_id])
@@ -85,11 +97,13 @@ async def expand_ids_for_user(cli: TelegramClient, uid_key: str, base_id: int) -
     try:
         ent = await cli.get_entity(base_id)
         if isinstance(ent, types.Channel):
-            # Telethon 1.40.x: use GetFullChannelRequest
             full = await cli(functions.channels.GetFullChannelRequest(channel=ent))
             linked = getattr(full.full_chat, 'linked_chat_id', None)
             if linked:
-                expanded.add(linked)
+                # linked é channel_id POSITIVO → converte para peer id longo (-100xxxx)
+                linked_full = get_peer_id(types.PeerChannel(linked))
+                expanded.add(linked_full)
+                log.info(f"[expand] uid={uid_key} base={base_id} linked_raw={linked} linked_full={linked_full}")
     except Exception as e:
         log.info(f"[expand] uid={uid_key} base={base_id} sem vinculo ({type(e).__name__})")
 
@@ -106,7 +120,6 @@ async def check_access_and_warn(cli: TelegramClient, uid_key: str, base_id: int)
     try:
         ent = await cli.get_entity(base_id)
         if isinstance(ent, types.Channel):
-            # força “conversa” e valida acesso
             await cli(functions.channels.GetFullChannelRequest(channel=ent))
     except errors.ChannelPrivateError:
         await bot.send_message(DEST_CHAT_ID, f"⚠️ user `{uid_key}`: canal `{base_id}` é privado (sem acesso).", parse_mode='Markdown')
@@ -117,9 +130,7 @@ async def check_access_and_warn(cli: TelegramClient, uid_key: str, base_id: int)
 
 # ── ENCAMINHAMENTO ──────────────────────────────────────────────────────────
 async def forward_with_fallback(send_client: TelegramClient, msg, header: str):
-    # cabeçalho
     await send_client.send_message(DEST_CHAT_ID, header, parse_mode='Markdown')
-    # tenta forward (usa o client do msg internamente)
     try:
         await msg.forward_to(DEST_CHAT_ID)
         return
@@ -128,7 +139,6 @@ async def forward_with_fallback(send_client: TelegramClient, msg, header: str):
     except Exception as e:
         log.info(f"[forward] {type(e).__name__} -> tentando reenvio bruto")
 
-    # download + reenvio
     try:
         if msg.media:
             path = await msg.download_media()
@@ -146,19 +156,19 @@ async def poller(cli: TelegramClient, uid_key: str):
         try:
             allowed = await compute_allowed_ids(cli, uid_key)
             base_allowed = set(subscriptions.get(uid_key, []))
-            targets = set(allowed) | base_allowed  # sempre varre o canal base
+            targets = set(allowed) | base_allowed  # também varre o canal base
 
             for chat_id in targets:
                 last = get_last(uid_key, chat_id)
-                msgs = await cli.get_messages(chat_id, limit=5)
+                try:
+                    msgs = await cli.get_messages(chat_id, limit=5)
+                except Exception:
+                    msgs = []
                 for m in reversed(msgs or []):
                     if not m.id or m.id <= last:
                         continue
 
-                    # (A) ok se chat_id é permitido
                     ok = chat_id in allowed
-
-                    # (B) ok se for forward cuja origem é o canal inscrito
                     if not ok and m.fwd_from and isinstance(m.fwd_from.from_id, types.PeerChannel):
                         try:
                             src = get_peer_id(m.fwd_from.from_id)
@@ -181,6 +191,8 @@ async def poller(cli: TelegramClient, uid_key: str):
         await asyncio.sleep(30)
 
 # ── DINÂMICOS ────────────────────────────────────────────────────────────────
+user_clients: Dict[str, TelegramClient] = {}
+
 async def ensure_client(uid: int):
     key = str(uid)
     sess = sessions.get(key)
@@ -193,13 +205,13 @@ async def ensure_client(uid: int):
     await cli.start()
     user_clients[key] = cli
 
-    # força “conversa” e valida acesso ao base
+    # valida acesso & aquece link
     for base in subscriptions.get(key, []):
         asyncio.create_task(check_access_and_warn(cli, key, base))
 
     @cli.on(events.NewMessage)
     async def forward_user(ev):
-        # dedup
+        # dedupe simples
         if ev.message and ev.message.id:
             last = get_last(key, ev.chat_id)
             if ev.message.id <= last:
@@ -207,7 +219,6 @@ async def ensure_client(uid: int):
 
         log.info(f"🔍 [dynamic] user={key} got message from chat={ev.chat_id}")
 
-        # allowed por expansão
         try:
             allowed = await compute_allowed_ids(cli, key)
         except Exception:
@@ -216,7 +227,6 @@ async def ensure_client(uid: int):
         base_allowed = set(subscriptions.get(key, []))
         ok = ev.chat_id in allowed
 
-        # fallback: forward cuja origem é o canal base
         if not ok and ev.message.fwd_from and isinstance(ev.message.fwd_from.from_id, types.PeerChannel):
             try:
                 src = get_peer_id(ev.message.fwd_from.from_id)
@@ -273,7 +283,9 @@ async def ui_handler(ev):
                 await reply(f'✅ `{user_id}` inscrito em `{gid}`.')
                 LINK_CACHE.pop(user_id, None)
                 await ensure_client(int(user_id))
-                asyncio.create_task(check_access_and_warn(user_clients[user_id], user_id, gid))
+                cli = user_clients.get(user_id)
+                if cli:
+                    asyncio.create_task(check_access_and_warn(cli, user_id, gid))
         except:
             return await reply('❌ Uso: `/admin_subscribe USER_ID GROUP_ID`')
         return
@@ -313,7 +325,8 @@ async def ui_handler(ev):
                 if isinstance(ent, types.Channel):
                     full = await cli(functions.channels.GetFullChannelRequest(channel=ent))
                     linked = getattr(full.full_chat, 'linked_chat_id', None)
-                    out.append(f"- broadcast={ent.broadcast} megagroup={ent.megagroup} linked={linked}")
+                    linked_full = get_peer_id(types.PeerChannel(linked)) if linked else None
+                    out.append(f"- broadcast={ent.broadcast} megagroup={ent.megagroup} linked_raw={linked} linked_full={linked_full}")
             except Exception as e:
                 out.append(f"- get_entity/full: {type(e).__name__}")
 
@@ -377,7 +390,9 @@ async def ui_handler(ev):
         LINK_CACHE.pop(key, None)
         await reply(f'✅ Inscrito em `{gid}`.')
         await ensure_client(uid)
-        asyncio.create_task(check_access_and_warn(user_clients[key], key, gid))
+        cli2 = user_clients.get(key)
+        if cli2:
+            asyncio.create_task(check_access_and_warn(cli2, key, gid))
         return
 
     if txt.startswith('/unsubscribe '):
