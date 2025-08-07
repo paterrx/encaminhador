@@ -1,14 +1,19 @@
-import streamlit as st
-import json
 import os
+import json
+import streamlit as st
 
-# ─── Caminhos ────────────────────────────────────────────────────────────────
-PROJECT_ROOT  = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH   = os.path.join(PROJECT_ROOT, 'config.json')
-CHANNELS_PATH = os.path.join(PROJECT_ROOT, 'data', 'channels.json')
-AUDIT_PATH    = os.path.join(PROJECT_ROOT, 'data', 'audit.json')
+# ─── Paths persistidos em volume Docker (/data) ───────────────────────────────
+DATA_DIR    = '/data'
+SUBS_FILE   = os.path.join(DATA_DIR, 'subscriptions.json')
+AUDIT_FILE  = os.path.join(DATA_DIR, 'audit.json')
 
-# ─── Helpers de JSON ─────────────────────────────────────────────────────────
+# ─── Fixed channels vêm da env SOURCE_CHAT_IDS ───────────────────────────────
+try:
+    FIXED_CHANNELS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
+except json.JSONDecodeError:
+    FIXED_CHANNELS = []
+
+# ─── load helpers ─────────────────────────────────────────────────────────────
 def load_json(path, default):
     if not os.path.exists(path):
         return default
@@ -18,60 +23,53 @@ def load_json(path, default):
     except:
         return default
 
-def save_json(path, obj):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(obj, f, indent=2)
+# ─── Dados ────────────────────────────────────────────────────────────────────
+subscriptions = load_json(SUBS_FILE, {})  # { user_id_str: [chat_id, ...], ... }
+audit_events  = load_json(AUDIT_FILE, [])
 
-# ─── Carrega dados ───────────────────────────────────────────────────────────
-channels_map = load_json(CHANNELS_PATH, {})                              # { name: id, ... }
-monitored    = load_json(CONFIG_PATH, {}).get('telegram_channel_ids', []) # [ id, ... ]
-audit_events = load_json(AUDIT_PATH, [])
+# Dinâmicos: união de todos os chat_ids inscritos pelos usuários
+dynamic_set = set()
+for lst in subscriptions.values():
+    for cid in lst:
+        dynamic_set.add(cid)
+DYNAMIC_CHANNELS = sorted(dynamic_set)
 
-# ─── UI ─────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Dashboard de Canais & Audit", layout="wide")
-st.title("🚀 Gerenciador de Canais")
+# ─── UI ──────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Dashboard Admin – Encaminhador", layout="wide")
+st.title("📊 Dashboard Admin — Encaminhador")
 
-# Sidebar: canais atualmente monitorados
-st.sidebar.header("Canais Monitorados Atualmente")
-if monitored:
-    for cid in monitored:
-        name = next((n for n, i in channels_map.items() if i == cid), None)
-        label = f"{name} — `{cid}`" if name else f"`{cid}`"
-        st.sidebar.success(label)
+# Fixed
+st.subheader("🔒 Canais Originais (fixos)")
+if FIXED_CHANNELS:
+    for cid in FIXED_CHANNELS:
+        st.markdown(f"- `{cid}`")
 else:
-    st.sidebar.info("Nenhum canal monitorado ainda.")
+    st.info("Nenhum canal fixo configurado em SOURCE_CHAT_IDS.")
 
-st.sidebar.divider()
-st.sidebar.markdown(
-    "Para alterar a lista, selecione abaixo e clique em **Salvar**.\n\n"
-    "Depois, atualize a página manualmente."
-)
+st.markdown("---")
 
-# Seleção de canais
-st.subheader("Selecione os Canais para Monitorar")
-channel_names = sorted(channels_map.keys())
-default_sel    = [n for n, i in channels_map.items() if i in monitored]
-selected_names = st.multiselect("Canais disponíveis", channel_names, default=default_sel)
-
-if st.button("Salvar Alterações"):
-    new_ids = [channels_map[name] for name in selected_names]
-    save_json(CONFIG_PATH, {'telegram_channel_ids': new_ids})
-    st.success("✅ Configurações salvas! Atualize a página para aplicar.")
+# Dinâmicos
+st.subheader("✨ Canais Dinâmicos (inscritos pelos usuários)")
+if DYNAMIC_CHANNELS:
+    for cid in DYNAMIC_CHANNELS:
+        st.markdown(f"- `{cid}`")
+else:
+    st.info("Nenhuma inscrição dinâmica no momento.")
 
 st.markdown("---")
 
 # Audit Trail
 st.subheader("📝 Audit Trail (últimos 50 eventos)")
 if not audit_events:
-    st.info("Nenhum evento registrado ainda.")
+    st.info("Nenhum evento de forwarding/audit registrado ainda.")
 else:
-    # mostra apenas alguns campos e os últimos 50
+    # Só exibimos três campos pra resumir: hora, chat_id, status
     display = []
     for ev in audit_events[-50:]:
+        ts = ev.get("ts", "")[:19].replace("T", " ")
         display.append({
-            "Hora"     : ev.get("ts", "")[:19].replace("T"," "),
-            "Chat ID"  : ev.get("cid", ""),
-            "Status"   : ev.get("status", ""),
+            "Hora"    : ts,
+            "Chat ID" : ev.get("cid", ""),
+            "Status"  : ev.get("status", "")
         })
     st.table(display)
