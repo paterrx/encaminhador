@@ -13,7 +13,7 @@ API_ID          = int(os.environ['TELEGRAM_API_ID'])
 API_HASH        = os.environ['TELEGRAM_API_HASH']
 BOT_TOKEN       = os.environ['BOT_TOKEN']
 DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])
-SESSION_STRING  = os.environ['SESSION_STRING']           # sessão admin (fixos)
+SESSION_STRING  = os.environ['SESSION_STRING']              # sessão ADMIN (user)
 SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS','[]'))
 
 _raw_admins = os.environ.get('ADMIN_IDS','[]')
@@ -24,9 +24,9 @@ except:
     ADMIN_IDS = set()
 
 DATA_DIR   = '/data'
-SESS_FILE  = os.path.join(DATA_DIR, 'sessions.json')       # { "uid": "StringSession" }
-SUBS_FILE  = os.path.join(DATA_DIR, 'subscriptions.json')  # { "uid": [group_ids...] }
-STATE_FILE = os.path.join(DATA_DIR, 'state.json')          # { "last": {uid: {chat_id: msg_id}} }
+SESS_FILE  = os.path.join(DATA_DIR, 'sessions.json')        # { "uid": "StringSession" }
+SUBS_FILE  = os.path.join(DATA_DIR, 'subscriptions.json')   # { "uid": [group_ids...] }
+STATE_FILE = os.path.join(DATA_DIR, 'state.json')           # { "last": {uid: {chat_id: msg_id}} }
 
 # ── LOG ──────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -56,6 +56,13 @@ def set_last(uid: str, chat_id: int, msg_id: int):
     state.setdefault('last', {}).setdefault(uid, {})[str(chat_id)] = int(msg_id)
     save_file(STATE_FILE, state)
 
+def md_escape(s: str) -> str:
+    if not s: return s
+    return (s.replace("\\","\\\\")
+             .replace("`","\\`")
+             .replace("*","\\*")
+             .replace("_","\\_"))
+
 # ── FLASK ────────────────────────────────────────────────────────────────────
 app = Flask('keep_alive')
 
@@ -77,8 +84,8 @@ def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)), debug=False)
 
 # ── CLIENTES ─────────────────────────────────────────────────────────────────
-bot          = TelegramClient('bot_session', API_ID, API_HASH)                 # envia p/ DEST
-admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) # lê fixos
+bot          = TelegramClient('bot_session', API_ID, API_HASH)                    # interface de comandos
+admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)    # SÓ ELE envia ao DEST
 
 user_clients: Dict[str, TelegramClient] = {}   # uid -> client
 LINK_CACHE: Dict[str, Dict[int, Set[int]]] = {} # uid -> {base_id: {base_id, linked_full}}
@@ -86,8 +93,7 @@ LINK_CACHE: Dict[str, Dict[int, Set[int]]] = {} # uid -> {base_id: {base_id, lin
 # ── EXPANSÃO E CHECKS ────────────────────────────────────────────────────────
 async def expand_ids_for_user(cli: TelegramClient, uid_key: str, base_id: int) -> Set[int]:
     """
-    Retorna o conjunto de IDs permitidos para esse base_id, incluindo o chat
-    de discussão vinculado (convertido corretamente para peer id longo).
+    Retorna base_id + chat de discussão vinculado (convertido para -100... se existir).
     """
     cache = LINK_CACHE.setdefault(uid_key, {})
     if base_id in cache:
@@ -100,8 +106,7 @@ async def expand_ids_for_user(cli: TelegramClient, uid_key: str, base_id: int) -
             full = await cli(functions.channels.GetFullChannelRequest(channel=ent))
             linked = getattr(full.full_chat, 'linked_chat_id', None)
             if linked:
-                # linked é channel_id POSITIVO → converte para peer id longo (-100xxxx)
-                linked_full = get_peer_id(types.PeerChannel(linked))
+                linked_full = get_peer_id(types.PeerChannel(linked))  # -> -100xxxxxxxxxx
                 expanded.add(linked_full)
                 log.info(f"[expand] uid={uid_key} base={base_id} linked_raw={linked} linked_full={linked_full}")
     except Exception as e:
@@ -122,41 +127,62 @@ async def check_access_and_warn(cli: TelegramClient, uid_key: str, base_id: int)
         if isinstance(ent, types.Channel):
             await cli(functions.channels.GetFullChannelRequest(channel=ent))
     except errors.ChannelPrivateError:
-        await bot.send_message(DEST_CHAT_ID, f"⚠️ user `{uid_key}`: canal `{base_id}` é privado (sem acesso).", parse_mode='Markdown')
+        await admin_client.send_message(DEST_CHAT_ID, f"⚠️ user `{uid_key}`: canal `{base_id}` é privado (sem acesso).", parse_mode='Markdown')
     except errors.ChannelInvalidError:
-        await bot.send_message(DEST_CHAT_ID, f"⚠️ user `{uid_key}`: canal `{base_id}` inválido.", parse_mode='Markdown')
+        await admin_client.send_message(DEST_CHAT_ID, f"⚠️ user `{uid_key}`: canal `{base_id}` inválido.", parse_mode='Markdown')
     except Exception as e:
         log.info(f"[access] uid={uid_key} base={base_id} -> {type(e).__name__}")
 
-# ── ENCAMINHAMENTO ──────────────────────────────────────────────────────────
-async def forward_with_fallback(send_client: TelegramClient, msg, header: str):
-    await send_client.send_message(DEST_CHAT_ID, header, parse_mode='Markdown')
+# ── ENCAMINHAMENTO (sempre via admin_client para o DEST) ─────────────────────
+async def forward_with_fallback(src_client: TelegramClient, msg, title: str, chat_id: int):
+    header = f"📢 *{md_escape(title)}* (`{chat_id}`)"
+    # sempre resolvemos o DEST no admin_client
     try:
-        await msg.forward_to(DEST_CHAT_ID)
-        return
-    except errors.FloodWaitError as e:
-        await asyncio.sleep(e.seconds+1)
-    except Exception as e:
-        log.info(f"[forward] {type(e).__name__} -> tentando reenvio bruto")
+        await admin_client.get_entity(DEST_CHAT_ID)
+    except Exception:
+        pass
 
+    # header
+    await admin_client.send_message(DEST_CHAT_ID, header, parse_mode='Markdown')
+
+    # forward “puro” só se o remetente que envia ao DEST puder postar lá (não é o caso do user do amigo)
+    if src_client is admin_client:
+        try:
+            await msg.forward_to(DEST_CHAT_ID)
+            return
+        except errors.FloodWaitError as e:
+            await asyncio.sleep(e.seconds+1)
+        except Exception:
+            pass  # cai para o copy
+
+    # cópia de conteúdo (texto/mídia) — baixa com src_client e envia com admin_client
     try:
         if msg.media:
-            path = await msg.download_media()
-            await send_client.send_file(DEST_CHAT_ID, path, caption=(msg.text or ''))
+            path = await src_client.download_media(msg)
+            await admin_client.send_file(DEST_CHAT_ID, path, caption=(msg.text or ''))
         else:
-            await send_client.send_message(DEST_CHAT_ID, msg.text or '')
+            await admin_client.send_message(DEST_CHAT_ID, msg.text or '')
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds+1)
+        # tenta mais uma
+        try:
+            if msg.media:
+                path = await src_client.download_media(msg)
+                await admin_client.send_file(DEST_CHAT_ID, path, caption=(msg.text or ''))
+            else:
+                await admin_client.send_message(DEST_CHAT_ID, msg.text or '')
+        except Exception as e2:
+            log.exception(e2)
     except Exception as e:
         log.exception(e)
 
-# ── POLLER (varredura proativa) ─────────────────────────────────────────────
+# ── POLLER (pega perdidas) ──────────────────────────────────────────────────
 async def poller(cli: TelegramClient, uid_key: str):
     while True:
         try:
             allowed = await compute_allowed_ids(cli, uid_key)
             base_allowed = set(subscriptions.get(uid_key, []))
-            targets = set(allowed) | base_allowed  # também varre o canal base
+            targets = set(allowed) | base_allowed
 
             for chat_id in targets:
                 last = get_last(uid_key, chat_id)
@@ -168,7 +194,7 @@ async def poller(cli: TelegramClient, uid_key: str):
                     if not m.id or m.id <= last:
                         continue
 
-                    ok = chat_id in allowed
+                    ok = (chat_id in allowed)
                     if not ok and m.fwd_from and isinstance(m.fwd_from.from_id, types.PeerChannel):
                         try:
                             src = get_peer_id(m.fwd_from.from_id)
@@ -177,22 +203,18 @@ async def poller(cli: TelegramClient, uid_key: str):
                                 log.info(f"✅ [poll-accept-fwd] user={uid_key} chat={chat_id} <- base={src}")
                         except Exception:
                             pass
-
                     if not ok:
                         continue
 
-                    title_ent = await cli.get_entity(chat_id)
-                    title = getattr(title_ent, 'title', None) or str(chat_id)
-                    await forward_with_fallback(bot, m, f"📢 *{title}* (`{chat_id}`)")
+                    ent = await cli.get_entity(chat_id)
+                    title = getattr(ent, 'title', None) or str(chat_id)
+                    await forward_with_fallback(cli, m, title, chat_id)
                     set_last(uid_key, chat_id, m.id)
-
         except Exception as e:
             log.info(f"[poller] user={uid_key} erro {type(e).__name__}")
         await asyncio.sleep(30)
 
 # ── DINÂMICOS ────────────────────────────────────────────────────────────────
-user_clients: Dict[str, TelegramClient] = {}
-
 async def ensure_client(uid: int):
     key = str(uid)
     sess = sessions.get(key)
@@ -205,13 +227,12 @@ async def ensure_client(uid: int):
     await cli.start()
     user_clients[key] = cli
 
-    # valida acesso & aquece link
+    # aquece/valida acesso
     for base in subscriptions.get(key, []):
         asyncio.create_task(check_access_and_warn(cli, key, base))
 
     @cli.on(events.NewMessage)
     async def forward_user(ev):
-        # dedupe simples
         if ev.message and ev.message.id:
             last = get_last(key, ev.chat_id)
             if ev.message.id <= last:
@@ -242,7 +263,8 @@ async def ensure_client(uid: int):
 
         chat  = await cli.get_entity(ev.chat_id)
         title = getattr(chat, 'title', None) or str(ev.chat_id)
-        await forward_with_fallback(bot, ev.message, f"📢 *{title}* (`{ev.chat_id}`)")
+
+        await forward_with_fallback(cli, ev.message, title, ev.chat_id)
         if ev.message and ev.message.id:
             set_last(key, ev.chat_id, ev.message.id)
 
@@ -336,7 +358,7 @@ async def ui_handler(ev):
             except Exception as e:
                 out.append(f"- get_messages: {type(e).__name__}")
 
-            await bot.send_message(DEST_CHAT_ID, "```\n" + "\n".join(out) + "\n```", parse_mode='Markdown')
+            await admin_client.send_message(DEST_CHAT_ID, "```\n" + "\n".join(out) + "\n```", parse_mode='Markdown')
             return await reply('✅ Probe enviado.')
         except:
             return await reply('❌ Uso: `/admin_probe USER_ID GROUP_ID`')
@@ -421,7 +443,7 @@ async def forward_fixed(ev):
         return
     chat  = await admin_client.get_entity(cid)
     title = getattr(chat, 'title', None) or str(cid)
-    await forward_with_fallback(admin_client, ev.message, f"🏷️ *{title}* (`{cid}`)")
+    await forward_with_fallback(admin_client, ev.message, title, cid)
 
 # ── ENTRYPOINT ───────────────────────────────────────────────────────────────
 async def main():
@@ -430,13 +452,20 @@ async def main():
         admin_client.start(),
         bot.start(bot_token=BOT_TOKEN)
     )
+    # garante que o admin conhece o DEST
+    try:
+        await admin_client.get_entity(DEST_CHAT_ID)
+    except Exception:
+        pass
+
     # sobe todos os conhecidos
     for uid_str in set(list(sessions.keys()) + list(subscriptions.keys())):
         try:
             await ensure_client(int(uid_str))
         except Exception:
             log.exception(f"falha ao iniciar listener {uid_str}")
-    log.info("🤖 Bots rodando...")
+
+    log.info("🤖 Bot iniciado!")
     await asyncio.gather(
         admin_client.run_until_disconnected(),
         bot.run_until_disconnected()
