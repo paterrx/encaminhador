@@ -11,32 +11,22 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.channels import GetFullChannelRequest
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENV OBRIGATÓRIAS
+# ENV
 API_ID         = int(os.environ['TELEGRAM_API_ID'])
 API_HASH       = os.environ['TELEGRAM_API_HASH']
 BOT_TOKEN      = os.environ['BOT_TOKEN']
 
-# Canal principal de posts (onde entram as apostas)
-DEST_CHAT_ID   = int(os.environ['DEST_CHAT_ID'])
-
-# Canal SEPARADO para replicar comentários (vamos publicar um "post-espelho"
-# aqui e os comentários irão para o chat vinculado desse canal).
-DEST_COMMENTS_ID = int(os.environ['DEST_COMMENTS_ID'])
-
-# Session string do admin (sua conta) para ler os grupos fixos
-SESSION_STRING = os.environ.get('SESSION_STRING', '')
-
-# Canais fixos (lista JSON de ids -100...)
-SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
-
-# Admins (lista JSON de ids)
+DEST_CHAT_ID        = int(os.environ['DEST_CHAT_ID'])         # canal principal
+DEST_COMMENTS_ID    = int(os.environ['DEST_COMMENTS_ID'])     # canal para espelhar posts e replicar comentários
+SESSION_STRING      = os.environ.get('SESSION_STRING', '')    # sua conta (user) para ler fixos/mandar
+SOURCE_CHAT_IDS     = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
 try:
     ADMIN_IDS = set(json.loads(os.environ.get('ADMIN_IDS', '[]')))
 except Exception:
     ADMIN_IDS = set()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Persistência em volume /data
+# Persistência
 DATA_DIR   = '/data'
 SESS_FILE  = os.path.join(DATA_DIR, 'sessions.json')
 SUBS_FILE  = os.path.join(DATA_DIR, 'subscriptions.json')
@@ -67,7 +57,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("encaminhador")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Flask util
+# Flask
 app = Flask('keep_alive')
 
 @app.route('/')
@@ -92,67 +82,97 @@ admin_client: Optional[TelegramClient] = None
 if SESSION_STRING:
     admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# Descoberta de chats vinculados (origem e destino)
-fixed_discuss_by_base: Dict[int, Optional[int]] = {}     # base_channel_id -> discuss_id ou None
-dest_comments_discuss_id: Optional[int] = None           # chat vinculado do canal DEST_COMMENTS_ID
+# caches de discuss
+fixed_discuss_by_base: Dict[int, Optional[int]] = {}
+dest_comments_discuss_id: Optional[int] = None
 
-async def discover_linked_discuss(cli: TelegramClient, channel_id: int) -> Optional[int]:
+async def discover_linked_with_any(channel_id: int) -> Optional[int]:
     """
-    Retorna o chat vinculado (discussion) de um canal, se existir.
+    Descobre linked_chat_id tentando primeiro com a SUA CONTA (admin_client)
+    e, se falhar, tenta com o bot. Devolve None se não houver/você não tiver acesso.
     """
+    async def _one(cli: TelegramClient) -> Optional[int]:
+        try:
+            ent = await cli.get_entity(channel_id)
+            full = await cli(GetFullChannelRequest(ent))
+            linked = getattr(full.full_chat, 'linked_chat_id', None)
+            return int(linked) if linked else None
+        except Exception as e:
+            raise e
+
+    # preferir admin_client (geralmente tem acesso a tudo)
+    if admin_client:
+        try:
+            return await _one(admin_client)
+        except Exception as e:
+            log.warning(f"[discover] (admin) falhou para {channel_id}: {e}")
+
+    # fallback com o bot
     try:
-        ent = await cli.get_entity(channel_id)
-        full = await cli(GetFullChannelRequest(ent))
-        # Para canais, normalmente fica em: full.full_chat.linked_chat_id
-        linked = getattr(full.full_chat, 'linked_chat_id', None)
-        return int(linked) if linked else None
+        return await _one(bot)
     except Exception as e:
-        log.warning(f"[discover] não foi possível obter linked_chat_id de {channel_id}: {e}")
+        log.warning(f"[discover] (bot) falhou para {channel_id}: {e}")
         return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers de envio (encaminha/copia com fallback) e criação de post-espelho
+# Helpers de envio / espelho / comentários
 
-async def _send_header_and_copy(send_client: TelegramClient,
-                                dest_chat_id: int,
+def get_sender_for_outputs() -> TelegramClient:
+    """
+    Quem envia para os canais de destino?
+    Preferimos a SUA conta (admin_client). Se não houver, usa o bot.
+    """
+    return admin_client or bot
+
+async def _send_header_and_copy(dest_chat_id: int,
                                 src_client: TelegramClient,
                                 src_msg,
                                 header: str) -> int:
     """
     Envia header + mensagem (forward com fallback) para dest_chat_id.
-    Retorna o message_id enviado.
+    Retorna o id da msg enviada.
     """
+    sender = get_sender_for_outputs()
+
     # Cabeçalho
-    await send_client.send_message(dest_chat_id, header, parse_mode='Markdown')
+    try:
+        await sender.send_message(dest_chat_id, header, parse_mode='Markdown')
+    except Exception as e:
+        log.exception(f"[send] header falhou para {dest_chat_id}: {e}")
+        raise
 
     # 1) forward
     try:
         sent = await src_msg.forward_to(dest_chat_id)
+        log.info(f"[send] forward -> dest={dest_chat_id}, id={sent.id}")
         return sent.id
     except errors.FloodWaitError as e:
+        log.warning(f"[send] flood ({e.seconds}s) em forward; fazendo fallback")
         await asyncio.sleep(e.seconds + 1)
-    except Exception:
-        pass
+    except Exception as e:
+        log.info(f"[send] forward falhou ({e}); tentando copiar")
 
     # 2) download + reenvio
-    if src_msg.media:
-        path = await src_client.download_media(src_msg)
-        sent = await send_client.send_file(dest_chat_id, path, caption=src_msg.text or '')
+    try:
+        if src_msg.media:
+            path = await src_client.download_media(src_msg)
+            sent = await sender.send_file(dest_chat_id, path, caption=src_msg.text or '')
+        else:
+            sent = await sender.send_message(dest_chat_id, src_msg.text or '')
+        log.info(f"[send] copy -> dest={dest_chat_id}, id={sent.id}")
         return sent.id
-    else:
-        sent = await send_client.send_message(dest_chat_id, src_msg.text or '')
-        return sent.id
+    except Exception as e:
+        log.exception(f"[send] copy falhou para {dest_chat_id}: {e}")
+        raise
 
 async def post_to_both_and_map(src_client: TelegramClient,
                                src_chat_id: int,
                                src_msg) -> Tuple[int, int]:
     """
-    Publica o post no canal principal (DEST_CHAT_ID) e cria um espelho
-    no canal de comentários (DEST_COMMENTS_ID). Salva o mapeamento
-    (src_chat/src_msg.id -> dest_shadow_msg_id).
-    Retorna (id_no_dest_principal, id_no_canal_de_comentários).
+    Publica no canal principal e cria espelho no canal de comentários.
+    Mapeia (src_chat/src_msg.id -> id_do_espelho).
     """
-    # Descobre títulos
+    # título do canal de origem
     try:
         ent = await src_client.get_entity(src_chat_id)
         title = getattr(ent, 'title', None) or str(src_chat_id)
@@ -161,45 +181,42 @@ async def post_to_both_and_map(src_client: TelegramClient,
 
     header = f"📢 *{title}* (`{src_chat_id}`)"
 
-    # envia para o canal principal
-    main_id = await _send_header_and_copy(bot, DEST_CHAT_ID, src_client, src_msg, header)
+    main_id = await _send_header_and_copy(DEST_CHAT_ID,        src_client, src_msg, header)
+    shadow_id = await _send_header_and_copy(DEST_COMMENTS_ID,  src_client, src_msg, header)
 
-    # cria espelho no canal de comentários
-    shadow_id = await _send_header_and_copy(bot, DEST_COMMENTS_ID, src_client, src_msg, header)
-
-    # persiste mapeamento para usar nas réplicas de comentários
     shadow_map[map_key(src_chat_id, src_msg.id)] = shadow_id
     _save(MAP_FILE, shadow_map)
 
+    log.info(f"[map] {src_chat_id}/{src_msg.id} -> shadow {shadow_id}")
     return main_id, shadow_id
 
-async def replicate_comment_to_shadow(send_client: TelegramClient,
-                                      comment_msg,
+async def replicate_comment_to_shadow(comment_msg,
                                       author_name: str,
                                       shadow_top_id: int):
     """
-    Replica um comentário para o CHAT VINCULADO do canal de comentários,
-    **respondendo** ao post-espelho (shadow_top_id).
+    Replica comentário no chat vinculado do canal de comentários,
+    **respondendo** ao post espelhado.
     """
     if not dest_comments_discuss_id:
         return
 
+    sender = get_sender_for_outputs()
     prefix = f"👤 {author_name}\n"
-    if comment_msg.media:
-        path = await send_client.download_media(comment_msg)
-        await bot.send_file(dest_comments_discuss_id, path,
-                            caption=prefix + (comment_msg.text or ''),
-                            reply_to=shadow_top_id)
-    else:
-        await bot.send_message(dest_comments_discuss_id,
-                               prefix + (comment_msg.text or ''),
-                               reply_to=shadow_top_id)
+    try:
+        if comment_msg.media:
+            path = await sender.download_media(comment_msg)
+            await sender.send_file(dest_comments_discuss_id, path,
+                                   caption=prefix + (comment_msg.text or ''),
+                                   reply_to=shadow_top_id)
+        else:
+            await sender.send_message(dest_comments_discuss_id,
+                                      prefix + (comment_msg.text or ''),
+                                      reply_to=shadow_top_id)
+        log.info(f"[comment] -> discuss_dest={dest_comments_discuss_id} reply_to={shadow_top_id}")
+    except Exception as e:
+        log.exception(f"[comment] falhou: {e}")
 
 def get_top_id_from_comment(msg) -> Optional[int]:
-    """
-    Extrai o reply_to_top_id de uma mensagem de discussão.
-    """
-    # Telethon pode expor em msg.reply_to or msg.reply_to_top_id dependendo da versão
     try:
         if getattr(msg, 'reply_to_top_id', None):
             return int(msg.reply_to_top_id)
@@ -210,7 +227,7 @@ def get_top_id_from_comment(msg) -> Optional[int]:
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Handlers: FIXOS (admin_client)
+# FIXOS (admin_client)
 
 if admin_client:
     @admin_client.on(events.NewMessage)
@@ -218,56 +235,48 @@ if admin_client:
         cid = ev.chat_id
         m   = ev.message
 
-        # Mensagem vinda de um canal fixo?
         if cid in SOURCE_CHAT_IDS:
+            log.info(f"🔔 [fixed-post] chat={cid} msg={m.id}")
             await post_to_both_and_map(admin_client, cid, m)
             return
 
-        # Mensagem vinda de um CHAT VINCULADO a algum fixo?
-        # (descobrimos no startup e guardamos em fixed_discuss_by_base)
+        # se for o discuss de algum fixo
         if cid in fixed_discuss_by_base.values():
-            # precisamos descobrir qual base gerou esse chat
-            base_id = next((base for base, d in fixed_discuss_by_base.items() if d == cid), None)
+            base_id = next((b for b, d in fixed_discuss_by_base.items() if d == cid), None)
             if not base_id:
                 return
-
             top_id = get_top_id_from_comment(m)
             if not top_id:
                 return
 
             key = map_key(base_id, top_id)
             shadow_id = shadow_map.get(key)
-
-            # Se ainda não temos espelho (primeiro comentário chegou antes de postarmos),
-            # buscamos o post original e criamos espelho agora.
             if not shadow_id:
                 try:
                     original = await admin_client.get_messages(base_id, ids=top_id)
                     _, shadow_id = await post_to_both_and_map(admin_client, base_id, original)
                 except Exception as e:
-                    log.warning(f"[fixed-comment] não consegui criar espelho p/ {base_id}/{top_id}: {e}")
+                    log.warning(f"[fixed-comment] não consegui criar espelho {base_id}/{top_id}: {e}")
                     return
 
-            # nome do autor
             try:
                 s = await ev.get_sender()
                 author = (getattr(s, 'first_name', '') + ' ' + (getattr(s, 'last_name', '') or '')).strip() or (s.username or '—')
             except Exception:
                 author = '—'
-
-            await replicate_comment_to_shadow(admin_client, m, author, shadow_id)
+            log.info(f"💬 [fixed-comment] base={base_id} top={top_id}")
+            await replicate_comment_to_shadow(m, author, shadow_id)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dinâmicos (sessions fornecidas pelos usuários)
+# DINÂMICOS
 
 user_clients: Dict[str, TelegramClient] = {}
-user_discuss_by_base: Dict[str, Dict[int, Optional[int]]] = {}  # por usuário
+user_discuss_by_base: Dict[str, Dict[int, Optional[int]]] = {}
 
 async def ensure_client(uid: int) -> Optional[TelegramClient]:
     key = str(uid)
     if key in user_clients:
         return user_clients[key]
-
     sess = sessions.get(key)
     if not sess:
         return None
@@ -277,52 +286,46 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
     user_clients[key] = cli
     user_discuss_by_base[key] = {}
 
-    # Inscreve handler das mensagens desse user
     @cli.on(events.NewMessage)
     async def forward_user(ev):
         cid = ev.chat_id
         m   = ev.message
-
-        # Grupos base desse user
         bases = set(subscriptions.get(key, []))
 
-        # Descobre/guarda discuss de cada base (lazy)
         disc_map = user_discuss_by_base.get(key, {})
+
+        # se chegou do base e ainda não conhecemos discuss -> descobrir
         if cid in bases and cid not in disc_map:
-            disc_map[cid] = await discover_linked_discuss(cli, cid)
+            disc_map[cid] = await discover_linked_with_any(cid)
             user_discuss_by_base[key] = disc_map
 
-        # Calcula o conjunto "allowed" (base + discuss)
+        # allowed = base + discuss conhecidos
         allowed = set(bases)
         for b, d in disc_map.items():
             if d:
                 allowed.add(d)
 
-        # Se veio do base → postar/copy e mapear
         if cid in bases:
+            log.info(f"🔔 [dyn-post] user={uid} chat={cid} msg={m.id}")
             await post_to_both_and_map(cli, cid, m)
             return
 
-        # Se veio do discuss vinculado → replicar comentário
         if cid in allowed and cid not in bases:
-            # achar base_id dono desse discuss
             base_id = next((b for b, d in disc_map.items() if d == cid), None)
             if not base_id:
                 return
-
             top_id = get_top_id_from_comment(m)
             if not top_id:
                 return
 
             key_map = map_key(base_id, top_id)
             shadow_id = shadow_map.get(key_map)
-
             if not shadow_id:
                 try:
                     original = await cli.get_messages(base_id, ids=top_id)
                     _, shadow_id = await post_to_both_and_map(cli, base_id, original)
                 except Exception as e:
-                    log.warning(f"[dyn-comment] não consegui criar espelho p/ {base_id}/{top_id}: {e}")
+                    log.warning(f"[dyn-comment] não consegui criar espelho {base_id}/{top_id}: {e}")
                     return
 
             try:
@@ -330,8 +333,8 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
                 author = (getattr(s, 'first_name', '') + ' ' + (getattr(s, 'last_name', '') or '')).strip() or (s.username or '—')
             except Exception:
                 author = '—'
-
-            await replicate_comment_to_shadow(cli, m, author, shadow_id)
+            log.info(f"💬 [dyn-comment] user={uid} base={base_id} top={top_id}")
+            await replicate_comment_to_shadow(m, author, shadow_id)
 
     return cli
 
@@ -344,10 +347,6 @@ async def bot_commands(ev):
     txt = (ev.raw_text or '').strip()
     reply = ev.respond
 
-    def admin_only():
-        return uid in ADMIN_IDS
-
-    # /start
     if txt in ('/start', '/help'):
         return await reply(
             "👋 *Encaminhador Bot*\n\n"
@@ -360,14 +359,13 @@ async def bot_commands(ev):
             "• `/admin_set_session USER_ID SESSION`\n"
             "• `/admin_subscribe USER_ID GROUP_ID`\n"
             "• `/admin_unsubscribe USER_ID GROUP_ID`\n"
-            "• `/admin_who_from_session SESSION`  ← *descobre dono da session*",
+            "• `/admin_who_from_session SESSION`",
             parse_mode='Markdown'
         )
 
     if txt == '/myid':
         return await reply(f"🆔 `{uid}`", parse_mode='Markdown')
 
-    # Usuário: setar própria session
     if txt.startswith('/setsession '):
         sess = txt.split(' ', 1)[1].strip()
         sessions[str(uid)] = sess
@@ -375,7 +373,6 @@ async def bot_commands(ev):
         await ensure_client(uid)
         return await reply("✅ Session salva! Use `/listgroups`.")
 
-    # Usuário: listar grupos (da PRÓPRIA session)
     if txt == '/listgroups':
         cli = await ensure_client(uid)
         if not cli:
@@ -389,7 +386,6 @@ async def bot_commands(ev):
             return await reply("Sem grupos/canais visíveis nessa sessão.")
         return await reply("*Seus grupos:*\n" + "\n".join(lines[:100]), parse_mode='Markdown')
 
-    # Usuário: subscribe / unsubscribe
     if txt.startswith('/subscribe '):
         try:
             gid = int(txt.split(' ', 1)[1])
@@ -400,7 +396,7 @@ async def bot_commands(ev):
             return await reply("⚠️ Já inscrito.")
         lst.append(gid)
         _save(SUBS_FILE, subscriptions)
-        await ensure_client(uid)  # garante handler
+        await ensure_client(uid)
         return await reply("✅ Inscrito.")
 
     if txt.startswith('/unsubscribe '):
@@ -415,9 +411,9 @@ async def bot_commands(ev):
         _save(SUBS_FILE, subscriptions)
         return await reply("🗑️ Removido.")
 
-    # ── Admin only
+    # Admins
     if txt.startswith('/admin_set_session '):
-        if not admin_only():
+        if uid not in ADMIN_IDS:
             return await reply("🚫 Sem permissão.")
         try:
             _, user_id, sess = txt.split(' ', 2)
@@ -429,7 +425,7 @@ async def bot_commands(ev):
             return await reply("Uso: /admin_set_session USER_ID SESSION")
 
     if txt.startswith('/admin_subscribe '):
-        if not admin_only():
+        if uid not in ADMIN_IDS:
             return await reply("🚫 Sem permissão.")
         try:
             _, user_id, gid = txt.split(' ', 2)
@@ -445,7 +441,7 @@ async def bot_commands(ev):
             return await reply("Uso: /admin_subscribe USER_ID GROUP_ID")
 
     if txt.startswith('/admin_unsubscribe '):
-        if not admin_only():
+        if uid not in ADMIN_IDS:
             return await reply("🚫 Sem permissão.")
         try:
             _, user_id, gid = txt.split(' ', 2)
@@ -459,9 +455,8 @@ async def bot_commands(ev):
         except Exception:
             return await reply("Uso: /admin_unsubscribe USER_ID GROUP_ID")
 
-    # Descobrir dono da session (id/username)
     if txt.startswith('/admin_who_from_session '):
-        if not admin_only():
+        if uid not in ADMIN_IDS:
             return await reply("🚫 Sem permissão.")
         try:
             sess = txt.split(' ', 1)[1].strip()
@@ -478,22 +473,20 @@ async def bot_commands(ev):
 # MAIN
 
 async def main():
-    # Flask em background
     asyncio.create_task(asyncio.to_thread(run_flask))
 
-    # Inicia bot + admin
     await bot.start(bot_token=BOT_TOKEN)
-
     if admin_client:
         await admin_client.start()
 
-        # Descobre discuss de cada canal fixo
+        # Descobre discuss dos fixos via sua conta
         for base in SOURCE_CHAT_IDS:
-            fixed_discuss_by_base[base] = await discover_linked_discuss(admin_client, base)
+            fixed_discuss_by_base[base] = await discover_linked_with_any(base)
+            log.info(f"[discover] base={base} discuss={fixed_discuss_by_base[base]}")
 
-    # Descobre discuss do canal de comentários (destino)
+    # Descobre discuss do canal de comentários (preferindo admin)
     global dest_comments_discuss_id
-    dest_comments_discuss_id = await discover_linked_discuss(bot, DEST_COMMENTS_ID)
+    dest_comments_discuss_id = await discover_linked_with_any(DEST_COMMENTS_ID)
     log.info(f"[dest] discuss_id para DEST_COMMENTS_ID={DEST_COMMENTS_ID} → {dest_comments_discuss_id}")
 
     log.info("🤖 Bot iniciado!")
