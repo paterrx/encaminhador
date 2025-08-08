@@ -1,4 +1,4 @@
-# main.py (estável – sem backfill obrigatório)
+# main.py — estável (posts), destino resolvido como InputPeer pela sua sessão
 
 import os
 import json
@@ -16,19 +16,14 @@ from telethon.tl.types import Message
 # ───────────────────────────── CONFIG ─────────────────────────────
 API_ID          = int(os.environ['TELEGRAM_API_ID'])
 API_HASH        = os.environ['TELEGRAM_API_HASH']
-BOT_TOKEN       = os.environ['BOT_TOKEN']
+BOT_TOKEN       = os.environ['BOT_TOKEN']             # bot só para UI no PV
+DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])     # canal/grupo destino dos posts
 
-# Canal onde os POSTS vão
-DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])
-
-# Grupo onde os COMENTÁRIOS serão clonados (se 0, não clona comentários)
-DEST_DISCUSS_ID = int(os.environ.get('DEST_DISCUSS_ID', '0') or 0)
-
-# Admin (canais fixos)
+# sua conta (admin) envia e também escuta os canais fixos
 SESSION_STRING  = os.environ['SESSION_STRING']
 SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
 
-# Incluir automaticamente os chats vinculados para dinâmicos
+# incluir chats vinculados para dinâmicos (opcional)
 INCLUDE_LINKED_DYNAMIC = bool(int(os.environ.get('INCLUDE_LINKED_DYNAMIC', '1')))
 
 # Persistência
@@ -36,7 +31,6 @@ DATA_DIR  = '/data'
 SESS_FILE = os.path.join(DATA_DIR, 'sessions.json')
 SUBS_FILE = os.path.join(DATA_DIR, 'subscriptions.json')
 AUD_FILE  = os.path.join(DATA_DIR, 'audit.json')
-POSTMAP_FILE = os.path.join(DATA_DIR, 'postmap.json')   # (base_id:msg_id) -> dest_msg_id
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -57,13 +51,9 @@ def _save_json(path: str, data):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-sessions: Dict[str, str]               = _load_json(SESS_FILE, {})
-subscriptions: Dict[str, List[int]]    = _load_json(SUBS_FILE, {})
-audit: List[dict]                      = _load_json(AUD_FILE, [])
-postmap: Dict[str, int]                = _load_json(POSTMAP_FILE, {})
-
-def _key(base_id: int, msg_id: int) -> str:
-    return f"{base_id}:{msg_id}"
+sessions: Dict[str, str]            = _load_json(SESS_FILE, {})
+subscriptions: Dict[str, List[int]] = _load_json(SUBS_FILE, {})
+audit: List[dict]                   = _load_json(AUD_FILE, [])
 
 def audit_push(event: dict):
     event['ts'] = int(time.time())
@@ -86,23 +76,26 @@ def dump_audit(): return jsonify(audit)
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
 
-# ─────────────────────── CLIENTES ───────────────────────
+# ─────────────────────── Telethon clients ───────────────────────
+# bot: só comandos no PV
 bot = TelegramClient("bot_session", API_ID, API_HASH)
+
+# sua conta: escuta fixos e ENVIA para o destino
 admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# Mapeia chat_de_discussão -> canal_base
-linked_of: Dict[int, int] = {}
+# Quem envia de verdade:
+SENDER = admin_client
+DEST_ENTITY: Optional[object] = None  # InputPeer resolvido pela sua sessão
 
-# ───────── Descoberta de chat vinculado ─────────
+# ─────────────── Descoberta de chat vinculado (para dinâmicos se habilitado) ───────────────
 async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
-    """Retorna o id (-100...) do chat vinculado ao canal_id; 0 se não achar."""
     try:
         ent = await client.get_entity(channel_id)
     except Exception as e:
         log.debug(f"[linked] get_entity fail {channel_id}: {e}")
         return 0
 
-    # API oficial (GetFullChannel)
+    # API oficial
     try:
         req_cls = getattr(functions.channels, 'GetFullChannel', None)
         if req_cls is not None:
@@ -112,134 +105,81 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
             full = await client(GetFullChannelRequest(channel=ent))
         lc = getattr(full.full_chat, 'linked_chat_id', None)
         if lc:
-            return int(f"-100{lc}") if lc > 0 else lc
+            return int(f"-100{lc}") if lc > 0 else int(lc)
     except Exception as e:
         log.debug(f"[linked] API resolve failed for {channel_id}: {e}")
 
-    # Fallback por nome
+    # fallback por nome
     try:
         base = (getattr(ent, 'title', '') or '').strip().lower()
-        if base:
-            candidates = {
-                f"{base} chat", f"{base} - chat", f"{base} • chat", f"{base} – chat",
-            }
-            async for d in client.iter_dialogs():
-                title = (getattr(d.entity, 'title', '') or '').strip().lower()
-                if getattr(d.entity, 'megagroup', False):
-                    if title in candidates or (title.startswith(base) and 'chat' in title):
-                        log.info(f"[linked] guessed by name: {channel_id} -> {d.entity.id} ({title})")
-                        return int(d.entity.id)
+        if not base:
+            return 0
+        candidates = {f"{base} chat", f"{base} - chat", f"{base} • chat", f"{base} – chat"}
+        async for d in client.iter_dialogs():
+            title = (getattr(d.entity, 'title', '') or '').strip().lower()
+            if getattr(d.entity, 'megagroup', False):
+                if title in candidates or (title.startswith(base) and 'chat' in title):
+                    log.info(f"[linked] guessed by name: {channel_id} -> {d.entity.id} ({title})")
+                    return int(d.entity.id)
     except Exception as e:
         log.debug(f"[linked] name fallback failed for {channel_id}: {e}")
     return 0
 
-# ───────── Encaminhar/cópia (retorna id no destino) ─────────
-async def forward_with_fallback(send_client: TelegramClient, m: Message, header: str) -> Optional[int]:
-    # header
+# ─────────────── Encaminhar/cópia com fallback (ENVIO PELA SUA SESSÃO) ───────────────
+async def forward_with_fallback(m: Message, header: str):
+    # 1) header (pela SUA sessão e já com InputPeer)
     try:
-        await send_client.send_message(DEST_CHAT_ID, header, parse_mode='Markdown')
+        await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown')
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
-        await send_client.send_message(DEST_CHAT_ID, header, parse_mode='Markdown')
+        await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown')
+    except Exception as e:
+        log.warning(f"[send header] {type(e).__name__}: {e}")
 
-    # forward (pegar o objeto enviado pra mapear)
+    # 2) tenta forward (usa o client do PRÓPRIO m; se não tiver acesso, cai no fallback)
     try:
-        sent = await send_client.forward_messages(DEST_CHAT_ID, m)
-        if isinstance(sent, list):
-            sent = sent[0]
-        if sent:
-            return sent.id
+        await m.forward_to(DEST_ENTITY)
+        return
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
     except Exception:
         pass
 
-    # fallback download+reenviar
+    # 3) fallback: download + reenvio pela SUA sessão
     try:
         if m.media:
             path = await m.download_media()
-            sent = await send_client.send_file(DEST_CHAT_ID, path, caption=(m.text or ''))
+            await SENDER.send_file(DEST_ENTITY, path, caption=(m.text or ''))
         else:
-            sent = await send_client.send_message(DEST_CHAT_ID, m.text or '')
-        return getattr(sent, 'id', None)
+            await SENDER.send_message(DEST_ENTITY, m.text or '')
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
         try:
             if m.media:
                 path = await m.download_media()
-                sent = await send_client.send_file(DEST_CHAT_ID, path, caption=(m.text or ''))
+                await SENDER.send_file(DEST_ENTITY, path, caption=(m.text or ''))
             else:
-                sent = await send_client.send_message(DEST_CHAT_ID, m.text or '')
-            return getattr(sent, 'id', None)
-        except Exception:
-            return None
-    except Exception:
-        return None
+                await SENDER.send_message(DEST_ENTITY, m.text or '')
+        except Exception as e:
+            log.warning(f"[fallback resend] {type(e).__name__}: {e}")
+    except Exception as e:
+        log.warning(f"[fallback] {type(e).__name__}: {e}")
 
-# ───────── Replicar comentário ─────────
-async def replicate_comment(src_client: TelegramClient, ev: events.NewMessage.Event):
-    if not DEST_DISCUSS_ID:
-        return
-
-    base_id = linked_of.get(ev.chat_id)
-    if not base_id:
-        return
-
-    orig_post_id = getattr(ev.message, 'reply_to_msg_id', None)
-    if not orig_post_id:
-        return
-
-    dest_post_id = postmap.get(_key(base_id, orig_post_id))
-    if not dest_post_id:
-        return  # ainda não mapeado (post anterior ao boot)
-
-    # autor bonitinho
-    try:
-        s = await src_client.get_entity(ev.sender_id)
-        name = (getattr(s, 'first_name', '') or '') + (' ' + getattr(s, 'last_name', '') if getattr(s, 'last_name', None) else '')
-        user = f"{name.strip() or 'Usuário'}"
-        if getattr(s, 'username', None):
-            user += f" (@{s.username})"
-    except Exception:
-        user = "Usuário"
-
-    header = f"💬 {user}"
-    try:
-        await bot.send_message(DEST_DISCUSS_ID, header, reply_to=dest_post_id)
-        if ev.message.media:
-            path = await ev.message.download_media()
-            await bot.send_file(DEST_DISCUSS_ID, path, caption=(ev.message.text or ''), reply_to=dest_post_id)
-        else:
-            await bot.send_message(DEST_DISCUSS_ID, ev.message.text or '', reply_to=dest_post_id)
-    except errors.FloodWaitError as e:
-        await asyncio.sleep(e.seconds + 1)
-        if ev.message.media:
-            path = await ev.message.download_media()
-            await bot.send_file(DEST_DISCUSS_ID, path, caption=(ev.message.text or ''), reply_to=dest_post_id)
-        else:
-            await bot.send_message(DEST_DISCUSS_ID, ev.message.text or '', reply_to=dest_post_id)
-
-# ───────── Admin (canais fixos) ─────────
+# ─────────────── Admin: canais fixos (sua session) ───────────────
 @admin_client.on(events.NewMessage)
-async def fixed_listener(ev: events.NewMessage.Event):
+async def _fixed_listener(ev: events.NewMessage.Event):
     cid = ev.chat_id
-    if cid in SOURCE_CHAT_IDS:
-        chat  = await admin_client.get_entity(cid)
-        title = getattr(chat, 'title', None) or str(cid)
-        header = f"📢 *{title}* (`{cid}`)"
-        dest_id = await forward_with_fallback(bot, ev.message, header)
-        if dest_id:
-            postmap[_key(cid, ev.message.id)] = dest_id
-            _save_json(POSTMAP_FILE, postmap)
+    if cid not in SOURCE_CHAT_IDS:
         return
+    log.info(f"🔍 [fixed] got message in fixed chat={cid}")
+    chat  = await admin_client.get_entity(cid)
+    title = getattr(chat, 'title', None) or str(cid)
+    header = f"📢 *{title}* (`{cid}`)"
+    await forward_with_fallback(ev.message, header)
 
-    # comentário de chat vinculado de um canal fixo?
-    if DEST_DISCUSS_ID and cid in linked_of:
-        await replicate_comment(admin_client, ev)
-
-# ───────── Dinâmicos (users) ─────────
+# ─────────────── Usuários dinâmicos ───────────────
 user_clients: Dict[str, TelegramClient] = {}
-allowed_map: Dict[str, set] = {}   # uid -> chats permitidos (inclui vinculados)
+allowed_map: Dict[str, set] = {}   # uid -> set(chat_ids permitidos, incluindo linked)
 
 async def ensure_client(uid: int) -> Optional[TelegramClient]:
     key = str(uid)
@@ -260,16 +200,16 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
         return None
 
     user_clients[key] = cli
-    allowed_map[key] = set(subscriptions.get(key, []))
+    allowed = set(subscriptions.get(key, []))
+    allowed_map[key] = allowed
 
-    if INCLUDE_LINKED_DYNAMIC and allowed_map[key]:
-        base_list = list(allowed_map[key])
-        for base_id in base_list:
+    if INCLUDE_LINKED_DYNAMIC and allowed:
+        base = list(allowed)
+        for base_id in base:
             try:
                 linked = await resolve_linked_for(cli, base_id)
-                if linked:
+                if linked and linked not in allowed_map[key]:
                     allowed_map[key].add(linked)
-                    linked_of[linked] = base_id
             except Exception as e:
                 log.info(f"[expand] uid={uid} base_id={base_id} falha={type(e).__name__}")
 
@@ -278,25 +218,16 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
         aid = allowed_map.get(key, set())
         if ev.chat_id not in aid:
             return
-
-        # comentários
-        if DEST_DISCUSS_ID and ev.chat_id in linked_of:
-            await replicate_comment(cli, ev)
-            return
-
-        # posts
+        log.info(f"🔍 [dynamic] user={uid} got message from chat={ev.chat_id}")
         chat  = await cli.get_entity(ev.chat_id)
         title = getattr(chat, 'title', None) or str(ev.chat_id)
         header = f"📢 *{title}* (`{ev.chat_id}`)"
-        dest_id = await forward_with_fallback(bot, ev.message, header)
-        if dest_id:
-            postmap[_key(ev.chat_id, ev.message.id)] = dest_id
-            _save_json(POSTMAP_FILE, postmap)
+        await forward_with_fallback(ev.message, header)
 
     asyncio.create_task(cli.run_until_disconnected())
     return cli
 
-# ───────── BOT UI ─────────
+# ─────────────── BOT UI (DM) ───────────────
 @bot.on(events.NewMessage(func=lambda e: e.is_private))
 async def ui(ev: events.NewMessage.Event):
     uid = ev.sender_id
@@ -363,7 +294,9 @@ async def ui(ev: events.NewMessage.Event):
                 lines.append(f"- `{cid}` — {title}")
                 if len(lines) >= 50:
                     break
-        return await reply("📋 *Seus grupos:*\n" + ("\n".join(lines) if lines else "Nenhum."), parse_mode='Markdown')
+        if not lines:
+            return await reply("Nenhum grupo/canal encontrado.")
+        return await reply("📋 *Seus grupos:*\n" + "\n".join(lines), parse_mode='Markdown')
 
     if txt.startswith('/subscribe '):
         try:
@@ -391,7 +324,7 @@ async def ui(ev: events.NewMessage.Event):
         await ensure_client(uid)
         return await reply(f"🗑️ Removido `{gid}`.", parse_mode='Markdown')
 
-    # admin-only
+    # admin
     if txt.startswith('/admin_') and not await _is_admin():
         return await reply("🚫 Sem permissão.")
 
@@ -440,13 +373,19 @@ async def ui(ev: events.NewMessage.Event):
             await tmp.start()
             me = await tmp.get_me()
             info = [f"👤 *Owner ID:* `{me.id}`"]
+            name = " ".join(filter(None, [me.first_name, me.last_name]))
+            if name:
+                info.append(f"Nome: {name}")
             if me.username:
                 info.append(f"Username: @{me.username}")
+            if me.phone:
+                masked = me.phone[:-4] + "****" if len(me.phone) > 4 else "****"
+                info.append(f"Phone: +{masked}")
             await reply("\n".join(info), parse_mode='Markdown')
             await tmp.disconnect()
             return
         except Exception as e:
-            return await reply(f"❌ Falha: {type(e).__name__}")
+            return await reply(f"❌ Falha ao abrir session: {type(e).__name__}")
 
     if txt.startswith('/admin_listgroups_by_session '):
         parts = txt.split(' ', 2)
@@ -472,29 +411,32 @@ async def ui(ev: events.NewMessage.Event):
                     count += 1
                     if count >= limit:
                         break
-            await reply("\n".join(lines) if count else "Nenhum grupo/canal.", parse_mode='Markdown')
+            await reply("\n".join(lines) if count else "Nenhum grupo/canal encontrado.", parse_mode='Markdown')
             await tmp.disconnect()
             return
         except Exception as e:
-            return await reply(f"❌ Falha: {type(e).__name__}")
+            return await reply(f"❌ Falha ao listar grupos: {type(e).__name__}")
 
     return await reply("❓ Comando não reconhecido. Use /help.")
 
-# ───────── MAIN ─────────
+# ─────────────── MAIN ───────────────
 async def main():
+    # Flask
     threading.Thread(target=run_flask, daemon=True).start()
 
+    # inicia bot + sua conta
     await asyncio.gather(
         bot.start(bot_token=BOT_TOKEN),
         admin_client.start()
     )
 
-    # prepara linked_of para os canais fixos
-    for cid in SOURCE_CHAT_IDS:
-        linked = await resolve_linked_for(admin_client, cid)
-        if linked:
-            linked_of[linked] = cid
-            log.info(f"[discover] base={cid} discuss={linked}")
+    # Resolver o destino **como InputPeer pela SUA sessão** (evita o erro PeerChannel)
+    global DEST_ENTITY
+    try:
+        DEST_ENTITY = await SENDER.get_input_entity(DEST_CHAT_ID)
+    except Exception as e:
+        log.warning(f"[resolve dest] {type(e).__name__}: {e}; usando id literal")
+        DEST_ENTITY = DEST_CHAT_ID  # último recurso
 
     log.info("🤖 Bot iniciado!")
     await asyncio.gather(
