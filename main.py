@@ -17,14 +17,15 @@ from telethon.tl.types import Message
 API_ID          = int(os.environ['TELEGRAM_API_ID'])
 API_HASH        = os.environ['TELEGRAM_API_HASH']
 BOT_TOKEN       = os.environ['BOT_TOKEN']                 # só DM/comandos
-DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])         # canal destino dos posts
+
+DEST_POSTS_ID   = int(os.environ['DEST_CHAT_ID'])         # canal principal (posts)
+DEST_COMMENTS_ID= int(os.environ.get('DEST_COMMENTS_ID', '0') or 0)  # canal p/ mensagens de chat; 0 = desabilitado
 
 # Sua conta (envia e ouve fixos)
 SESSION_STRING  = os.environ['SESSION_STRING']
-SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
+SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))  # ids de canais fixos
 
-# Dinâmicos
-# OBS: deixe 0 pra NÃO ouvir o chat vinculado (megagroup). 1 se quiser incluir.
+# Dinâmicos: 1 inclui chats vinculados automaticamente; 0 não
 INCLUDE_LINKED_DYNAMIC = bool(int(os.environ.get('INCLUDE_LINKED_DYNAMIC', '0')))
 
 # Persistência
@@ -32,7 +33,6 @@ DATA_DIR   = '/data'
 SESS_FILE  = os.path.join(DATA_DIR, 'sessions.json')
 SUBS_FILE  = os.path.join(DATA_DIR, 'subscriptions.json')
 AUD_FILE   = os.path.join(DATA_DIR, 'audit.json')
-
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ───────────────────────────── LOG ─────────────────────────────
@@ -64,30 +64,26 @@ def audit_push(event: dict):
 
 # ─────────────────────── normalização de IDs ───────────────────────
 def normalize_gid(gid: int) -> int:
-    """Garante formato -100xxxxxxxxxxxx para canais/supergrupos."""
     s = str(gid)
-    if s.startswith('-100'):
-        return int(s)
-    if s.startswith('-'):
-        return int('-100' + s[1:])
+    if s.startswith('-100'): return int(s)
+    if s.startswith('-'):    return int('-100' + s[1:])
     return gid
 
 def migrate_sub_ids():
     changed = False
     for uid, lst in list(subscriptions.items()):
-        nlst = []
+        fixed = []
         for g in lst:
             try:
                 ng = normalize_gid(int(g))
+                fixed.append(ng)
+                if ng != g: changed = True
             except Exception:
-                continue
-            nlst.append(ng)
-            if ng != g:
-                changed = True
-        subscriptions[uid] = sorted(list(set(nlst)))
+                pass
+        subscriptions[uid] = sorted(list(set(fixed)))
     if changed:
         _save_json(SUBS_FILE, subscriptions)
-        log.info("[migrate] subscriptions normalizadas para formato -100…")
+        log.info("[migrate] subscriptions normalizadas para -100…")
 
 # ─────────────────────── FLASK keep-alive ───────────────────────
 app = Flask("keep_alive")
@@ -104,63 +100,51 @@ def dump_audit(): return jsonify(audit)
 def _sanitize_sessions_dict(d: dict) -> dict:
     out = {}
     for uid, sess in (d or {}).items():
-        if not sess:
-            continue
+        if not sess: continue
         try:
             fp = hashlib.sha256(sess.encode("utf-8")).hexdigest()[:10]
-            preview = f"{sess[:6]}…{sess[-6:]}" if len(sess) >= 14 else "…"
-            out[str(uid)] = {
-                "fingerprint": fp,
-                "preview": preview,
-                "length": len(sess),
-                "has_subs": bool(subscriptions.get(str(uid))),
-            }
+            prev = f"{sess[:6]}…{sess[-6:]}" if len(sess) >= 14 else "…"
+            out[str(uid)] = {"fingerprint": fp, "preview": prev, "length": len(sess), "has_subs": bool(subscriptions.get(str(uid)))}
         except Exception:
             pass
     return out
 
 @app.route("/dump_sessions")
-def dump_sessions():
-    return jsonify(_sanitize_sessions_dict(_load_json(SESS_FILE, {})))
+def dump_sessions(): return jsonify(_sanitize_sessions_dict(_load_json(SESS_FILE, {})))
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
 
 # ─────────────────────── Telethon clients ───────────────────────
-# bot: apenas para conversar no PV com você (comandos). NÃO posta no canal.
-bot = TelegramClient("bot_session", API_ID, API_HASH)
+bot = TelegramClient("bot_session", API_ID, API_HASH)  # comandos em PV
 
-# sua conta (admin): escuta canais fixos E envia para o destino
-admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)  # sua conta
 
-# Quem realmente envia:
+# Quem envia:
 SENDER = admin_client
-DEST_ENTITY: Optional[object] = None  # cache do destino resolvido pelo SENDER
+DEST_POSTS_ENTITY: Optional[object] = None
+DEST_COMMENTS_ENTITY: Optional[object] = None  # None = indisponível/desabilitado
 
-# DEDUPE simples em memória (evita reenvio da mesma mensagem)
+# DEDUPE de mensagens
 DEDUP_MAX = 5000
 _seen: Set[Tuple[int, int]] = set()
-
 def seen(chat_id: int, msg_id: int) -> bool:
     key = (int(chat_id), int(msg_id))
-    if key in _seen:
-        return True
+    if key in _seen: return True
     _seen.add(key)
-    # limpeza simples
     if len(_seen) > DEDUP_MAX:
         for _ in range(len(_seen) - DEDUP_MAX):
-            _seen.pop()
+            try: _seen.pop()
+            except KeyError: break
     return False
 
-# ─────────────── Descoberta de chat vinculado (para dinâmicos se habilitado) ───────────────
+# ─────────────── Descoberta de chat vinculado (opcional) ───────────────
 async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
     try:
         ent = await client.get_entity(channel_id)
     except Exception as e:
         log.debug(f"[linked] get_entity fail {channel_id}: {e}")
         return 0
-
-    # API oficial
     try:
         req_cls = getattr(functions.channels, 'GetFullChannel', None)
         if req_cls is not None:
@@ -175,44 +159,47 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
         pass
     return 0
 
-# ─────────────── Encaminhar/cópia com fallback (ENVIO PELA SUA SESSÃO) ───────────────
-async def forward_with_fallback(m: Message, header: str):
-    # 1) header
+# ─────────────── envio com fallback ───────────────
+async def send_with_fallback(dest_entity, m: Message, header: str):
+    # header
     try:
-        await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown')
+        await SENDER.send_message(dest_entity, header, parse_mode='Markdown')
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
-        await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown')
+        await SENDER.send_message(dest_entity, header, parse_mode='Markdown')
 
-    # 2) tenta forward
+    # forward original
     try:
-        await m.forward_to(DEST_ENTITY)
+        await m.forward_to(dest_entity)
         return
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
     except Exception:
         pass
 
-    # 3) fallback: download + reenvio
+    # baixar/repostar
     try:
         if m.media:
             path = await m.download_media()
-            await SENDER.send_file(DEST_ENTITY, path, caption=(m.text or ''))
+            await SENDER.send_file(dest_entity, path, caption=(m.text or ''))
         else:
-            await SENDER.send_message(DEST_ENTITY, m.text or '')
+            await SENDER.send_message(dest_entity, m.text or '')
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
         if m.media:
             path = await m.download_media()
-            await SENDER.send_file(DEST_ENTITY, path, caption=(m.text or ''))
+            await SENDER.send_file(dest_entity, path, caption=(m.text or ''))
         else:
-            await SENDER.send_message(DEST_ENTITY, m.text or '')
+            await SENDER.send_message(dest_entity, m.text or '')
 
-# ─────────────── Admin: canais fixos (sua session) ───────────────
+# ─────────────── FIXOS (sua sessão) ───────────────
 @admin_client.on(events.NewMessage)
 async def fixed_listener(ev: events.NewMessage.Event):
     cid = ev.chat_id
     if cid not in SOURCE_CHAT_IDS:
+        return
+    # garantimos que mensagens de CHAT não vão pro principal
+    if ev.is_group:
         return
     if seen(cid, ev.message.id):
         return
@@ -220,11 +207,11 @@ async def fixed_listener(ev: events.NewMessage.Event):
     chat  = await admin_client.get_entity(cid)
     title = getattr(chat, 'title', None) or str(cid)
     header = f"📢 *{title}* (`{cid}`)"
-    await forward_with_fallback(ev.message, header)
+    await send_with_fallback(DEST_POSTS_ENTITY, ev.message, header)
 
-# ─────────────── Usuários dinâmicos ───────────────
+# ─────────────── DINÂMICOS ───────────────
 user_clients: Dict[str, TelegramClient] = {}
-allowed_map: Dict[str, set] = {}   # uid -> set(chat_ids permitidos, incluindo linked quando habilitado)
+allowed_map: Dict[str, set] = {}   # uid -> set(ids permitidos)
 
 async def ensure_client(uid: int) -> Optional[TelegramClient]:
     key = str(uid)
@@ -245,19 +232,21 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
         return None
 
     user_clients[key] = cli
-    # base permitidos (normalizados)
-    allowed = {normalize_gid(int(g)) for g in subscriptions.get(key, [])}
-    allowed_map[key] = set(allowed)
 
-    # opcional: incluir chat vinculado
-    if INCLUDE_LINKED_DYNAMIC and allowed:
-        for base_id in list(allowed):
+    # base permitidos (normalizados)
+    base_allowed = {normalize_gid(int(g)) for g in subscriptions.get(key, [])}
+    allowed = set(base_allowed)
+
+    # incluir chat vinculado se habilitado
+    if INCLUDE_LINKED_DYNAMIC and base_allowed:
+        for base_id in list(base_allowed):
             try:
                 linked = await resolve_linked_for(cli, base_id)
                 if linked:
-                    allowed_map[key].add(linked)
+                    allowed.add(linked)
             except Exception:
                 pass
+    allowed_map[key] = allowed
 
     @cli.on(events.NewMessage)
     async def forward_user(ev: events.NewMessage.Event):
@@ -266,14 +255,22 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
             return
         if seen(ev.chat_id, ev.message.id):
             return
-        log.info(f"🔍 [dynamic] user={uid} got message from chat={ev.chat_id}")
+
         chat  = await cli.get_entity(ev.chat_id)
         title = getattr(chat, 'title', None) or str(ev.chat_id)
         header = f"📢 *{title}* (`{ev.chat_id}`)"
-        await forward_with_fallback(ev.message, header)
+
+        # Roteamento:
+        if ev.is_group:
+            if DEST_COMMENTS_ENTITY is None:
+                # comentários desabilitados: ignora
+                return
+            await send_with_fallback(DEST_COMMENTS_ENTITY, ev.message, header)
+        else:
+            await send_with_fallback(DEST_POSTS_ENTITY, ev.message, header)
 
     asyncio.create_task(cli.run_until_disconnected())
-    log.info(f"🟢 listener dinâmico ligado para user={uid} allowed={sorted(list(allowed_map[key]))}")
+    log.info(f"🟢 listener dinâmico ligado para user={uid} allowed={sorted(list(allowed))}")
     return cli
 
 # ─────────────── BOT UI (DM) ───────────────
@@ -287,18 +284,13 @@ async def ui(ev: events.NewMessage.Event):
         admins_env = os.environ.get('ADMIN_IDS', '[]')
         try:
             parsed = json.loads(admins_env)
-            if isinstance(parsed, int):
-                return uid == parsed
-            elif isinstance(parsed, list):
-                return uid in parsed
-        except Exception:
-            pass
+            if isinstance(parsed, int):  return uid == parsed
+            if isinstance(parsed, list): return uid in parsed
+        except Exception: pass
         try:
             single = int(os.environ.get('ADMIN_ID', '0') or 0)
-            if single:
-                return uid == single
-        except Exception:
-            pass
+            if single: return uid == single
+        except Exception: pass
         return False
 
     if txt in ('/start', '/help'):
@@ -341,8 +333,7 @@ async def ui(ev: events.NewMessage.Event):
             title = getattr(ent, 'title', None) or getattr(ent, 'username', None) or str(cid)
             if getattr(ent, 'megagroup', False) or getattr(ent, 'broadcast', False):
                 lines.append(f"- `{cid}` — {title}")
-                if len(lines) >= 50:
-                    break
+                if len(lines) >= 50: break
         if not lines:
             return await reply("Nenhum grupo/canal encontrado.")
         return await reply("📋 *Seus grupos:*\n" + "\n".join(lines), parse_mode='Markdown')
@@ -353,10 +344,8 @@ async def ui(ev: events.NewMessage.Event):
         except Exception:
             return await reply("ID inválido.")
         lst = subscriptions.setdefault(str(uid), [])
-        if gid in lst:
-            return await reply("⚠️ Já inscrito.")
-        lst.append(gid)
-        _save_json(SUBS_FILE, subscriptions)
+        if gid in lst: return await reply("⚠️ Já inscrito.")
+        lst.append(gid); _save_json(SUBS_FILE, subscriptions)
         await ensure_client(uid)
         return await reply(f"✅ Inscrito em `{gid}`.", parse_mode='Markdown')
 
@@ -366,10 +355,8 @@ async def ui(ev: events.NewMessage.Event):
         except Exception:
             return await reply("ID inválido.")
         lst = subscriptions.get(str(uid), [])
-        if gid not in lst:
-            return await reply("⚠️ Não estava inscrito.")
-        lst.remove(gid)
-        _save_json(SUBS_FILE, subscriptions)
+        if gid not in lst: return await reply("⚠️ Não estava inscrito.")
+        lst.remove(gid); _save_json(SUBS_FILE, subscriptions)
         await ensure_client(uid)
         return await reply(f"🗑️ Removido `{gid}`.", parse_mode='Markdown')
 
@@ -380,8 +367,7 @@ async def ui(ev: events.NewMessage.Event):
     if txt.startswith('/admin_set_session '):
         try:
             _, u, sess = txt.split(' ', 2)
-            sessions[u] = sess
-            _save_json(SESS_FILE, sessions)
+            sessions[u] = sess; _save_json(SESS_FILE, sessions)
             await ensure_client(int(u))
             return await reply(f"✅ Session de `{u}` registrada e listener ativo.", parse_mode='Markdown')
         except Exception:
@@ -392,10 +378,8 @@ async def ui(ev: events.NewMessage.Event):
             _, u, g = txt.split(' ', 2)
             gid = normalize_gid(int(g))
             lst = subscriptions.setdefault(u, [])
-            if gid in lst:
-                return await reply("⚠️ Já inscrito.")
-            lst.append(gid)
-            _save_json(SUBS_FILE, subscriptions)
+            if gid in lst: return await reply("⚠️ Já inscrito.")
+            lst.append(gid); _save_json(SUBS_FILE, subscriptions)
             await ensure_client(int(u))
             return await reply(f"✅ `{u}` inscrito em `{gid}`.", parse_mode='Markdown')
         except Exception:
@@ -406,10 +390,8 @@ async def ui(ev: events.NewMessage.Event):
             _, u, g = txt.split(' ', 2)
             gid = normalize_gid(int(g))
             lst = subscriptions.get(u, [])
-            if gid not in lst:
-                return await reply("⚠️ Não inscrito.")
-            lst.remove(gid)
-            _save_json(SUBS_FILE, subscriptions)
+            if gid not in lst: return await reply("⚠️ Não inscrito.")
+            lst.remove(gid); _save_json(SUBS_FILE, subscriptions)
             await ensure_client(int(u))
             return await reply(f"🗑️ `{u}` removido de `{gid}`.", parse_mode='Markdown')
         except Exception:
@@ -423,10 +405,8 @@ async def ui(ev: events.NewMessage.Event):
             me = await tmp.get_me()
             info = [f"👤 *Owner ID:* `{me.id}`"]
             name = " ".join(filter(None, [me.first_name, me.last_name]))
-            if name:
-                info.append(f"Nome: {name}")
-            if me.username:
-                info.append(f"Username: @{me.username}")
+            if name: info.append(f"Nome: {name}")
+            if me.username: info.append(f"Username: @{me.username}")
             if me.phone:
                 masked = me.phone[:-4] + "****" if len(me.phone) > 4 else "****"
                 info.append(f"Phone: +{masked}")
@@ -441,16 +421,13 @@ async def ui(ev: events.NewMessage.Event):
         sess = parts[1].strip()
         limit = 40
         if len(parts) == 3:
-            try:
-                limit = max(1, min(100, int(parts[2])))
-            except Exception:
-                pass
+            try: limit = max(1, min(100, int(parts[2])))
+            except Exception: pass
         try:
             tmp = TelegramClient(StringSession(sess), API_ID, API_HASH)
             await tmp.start()
             me = await tmp.get_me()
-            lines = [f"👤 *Owner ID:* `{me.id}`", "📋 *Grupos/Canais:*"]
-            count = 0
+            lines, count = [f"👤 *Owner ID:* `{me.id}`", "📋 *Grupos/Canais:*"], 0
             async for d in tmp.iter_dialogs():
                 ent = d.entity
                 cid = getattr(ent, 'id', None)
@@ -458,8 +435,7 @@ async def ui(ev: events.NewMessage.Event):
                     title = getattr(ent, 'title', None) or getattr(ent, 'username', None) or str(cid)
                     lines.append(f"- `{cid}` — {title}")
                     count += 1
-                    if count >= limit:
-                        break
+                    if count >= limit: break
             await reply("\n".join(lines) if count else "Nenhum grupo/canal encontrado.", parse_mode='Markdown')
             await tmp.disconnect()
             return
@@ -470,34 +446,36 @@ async def ui(ev: events.NewMessage.Event):
 
 # ─────────────── MAIN ───────────────
 async def main():
-    # migra ids antigos (sem -100)
     migrate_sub_ids()
-
-    # Flask
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # inicia bot + sua conta
     await asyncio.gather(
         bot.start(bot_token=BOT_TOKEN),
         admin_client.start()
     )
 
-    # Resolver o destino **com a sua sessão**
-    global DEST_ENTITY
+    # Resolver destinos pela SUA sessão
+    global DEST_POSTS_ENTITY, DEST_COMMENTS_ENTITY
     try:
-        DEST_ENTITY = await SENDER.get_entity(DEST_CHAT_ID)
+        DEST_POSTS_ENTITY = await SENDER.get_entity(DEST_POSTS_ID)
     except Exception:
-        DEST_ENTITY = DEST_CHAT_ID  # último recurso
+        DEST_POSTS_ENTITY = DEST_POSTS_ID
+    if DEST_COMMENTS_ID:
+        try:
+            DEST_COMMENTS_ENTITY = await SENDER.get_entity(DEST_COMMENTS_ID)
+        except Exception:
+            DEST_COMMENTS_ENTITY = DEST_COMMENTS_ID
+    else:
+        DEST_COMMENTS_ENTITY = None
+        log.info("💬 Clonagem de chat DESABILITADA (DEST_COMMENTS_ID não definido).")
 
-    # reativar listeners dinâmicos existentes
+    # reativar listeners dinâmicos já salvos
     if subscriptions:
         uids = [int(u) for u in subscriptions.keys() if u in sessions]
         log.info(f"♻️ restaurando listeners dinâmicos: {uids}")
         for u in uids:
-            try:
-                await ensure_client(u)
-            except Exception:
-                pass
+            try: await ensure_client(u)
+            except Exception: pass
 
     log.info("🤖 Bot iniciado!")
     await asyncio.gather(
