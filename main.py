@@ -1,11 +1,11 @@
-# main.py — estável (apenas posts). Restaura listeners dinâmicos no startup.
-
+# main.py
 import os
 import json
 import time
 import asyncio
 import threading
 import logging
+import hashlib
 from typing import Dict, List, Optional
 
 from flask import Flask, jsonify
@@ -16,14 +16,17 @@ from telethon.tl.types import Message
 # ───────────────────────────── CONFIG ─────────────────────────────
 API_ID          = int(os.environ['TELEGRAM_API_ID'])
 API_HASH        = os.environ['TELEGRAM_API_HASH']
-BOT_TOKEN       = os.environ['BOT_TOKEN']             # bot só para UI no PV
-DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])     # canal/grupo destino dos posts
+BOT_TOKEN       = os.environ['BOT_TOKEN']                # só DM/comandos
+DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])        # canal destino (posts)
 
-# sua conta (admin) envia e também escuta os canais fixos
+# Opcional (não usamos para envio; mantido só p/ futura feature)
+DEST_DISCUSS_ID = int(os.environ.get('DEST_DISCUSS_ID', '0') or 0)
+
+# Admin (sua conta) — escuta canais fixos e ENVIA para o destino
 SESSION_STRING  = os.environ['SESSION_STRING']
 SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
 
-# incluir chats vinculados para dinâmicos (opcional)
+# Flag: incluir automaticamente os chats vinculados aos dinâmicos
 INCLUDE_LINKED_DYNAMIC = bool(int(os.environ.get('INCLUDE_LINKED_DYNAMIC', '1')))
 
 # Persistência
@@ -38,7 +41,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("encaminhador")
 
-# ─────────────────────── UTIL JSON ───────────────────────
+# ─────────────────────── UTIL: JSON persistente ───────────────────────
 def _load_json(path: str, default):
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -65,27 +68,74 @@ def audit_push(event: dict):
 app = Flask("keep_alive")
 
 @app.route("/")
-def home(): return "OK"
+def home():
+    return "OK"
 
 @app.route("/dump_subs")
-def dump_subs(): return jsonify(subscriptions)
+def dump_subs():
+    return jsonify(subscriptions)
 
 @app.route("/dump_audit")
-def dump_audit(): return jsonify(audit)
+def dump_audit():
+    return jsonify(audit)
+
+def _sanitize_sessions_dict(d: dict) -> dict:
+    out = {}
+    for uid, sess in (d or {}).items():
+        if not sess:
+            continue
+        try:
+            fp = hashlib.sha256(sess.encode("utf-8")).hexdigest()[:10]
+            preview = f"{sess[:6]}…{sess[-6:]}" if len(sess) >= 14 else "…"
+            out[str(uid)] = {
+                "fingerprint": fp,
+                "preview": preview,
+                "length": len(sess),
+                "has_subs": bool(subscriptions.get(str(uid))),
+            }
+        except Exception:
+            pass
+    return out
+
+@app.route("/dump_sessions")
+def dump_sessions():
+    # Lê do DISCO (não depende do dicionário em memória)
+    on_disk = _load_json(SESS_FILE, {})
+    return jsonify(_sanitize_sessions_dict(on_disk))
+
+@app.route("/dump_state")
+def dump_state():
+    def stat(p):
+        try:
+            return {
+                "exists": os.path.exists(p),
+                "size": os.path.getsize(p) if os.path.exists(p) else 0,
+                "mtime": int(os.path.getmtime(p)) if os.path.exists(p) else 0,
+            }
+        except Exception:
+            return {"exists": False, "size": 0, "mtime": 0}
+
+    return jsonify({
+        "sess_file": stat(SESS_FILE),
+        "subs_file": stat(SUBS_FILE),
+        "mem_sessions": len(sessions),
+        "mem_subscriptions": len(subscriptions),
+        "active_listeners": list(user_clients.keys()) if 'user_clients' in globals() else [],
+    })
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
 
 # ─────────────────────── Telethon clients ───────────────────────
-# bot: só comandos no PV
+# bot: PV/comandos (não posta no canal)
 bot = TelegramClient("bot_session", API_ID, API_HASH)
 
-# sua conta: escuta fixos e ENVIA para o destino
+# sua conta (admin): escuta fixos e envia
 admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# Quem envia de verdade:
+# Quem envia de fato
 SENDER = admin_client
-DEST_ENTITY: Optional[object] = None  # InputPeer resolvido pela sua sessão
+DEST_ENTITY: Optional[object] = None  # cache do destino resolvido pelo SENDER
 
 # ─────────────── Descoberta de chat vinculado (para dinâmicos se habilitado) ───────────────
 async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
@@ -95,7 +145,7 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
         log.debug(f"[linked] get_entity fail {channel_id}: {e}")
         return 0
 
-    # API oficial
+    # 1) API oficial
     try:
         req_cls = getattr(functions.channels, 'GetFullChannel', None)
         if req_cls is not None:
@@ -109,7 +159,7 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
     except Exception as e:
         log.debug(f"[linked] API resolve failed for {channel_id}: {e}")
 
-    # fallback por nome
+    # 2) fallback por nome (ex.: "<canal> chat"), assumindo que o user está no chat
     try:
         base = (getattr(ent, 'title', '') or '').strip().lower()
         if not base:
@@ -117,6 +167,8 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
         candidates = {f"{base} chat", f"{base} - chat", f"{base} • chat", f"{base} – chat"}
         async for d in client.iter_dialogs():
             title = (getattr(d.entity, 'title', '') or '').strip().lower()
+            if not title:
+                continue
             if getattr(d.entity, 'megagroup', False):
                 if title in candidates or (title.startswith(base) and 'chat' in title):
                     log.info(f"[linked] guessed by name: {channel_id} -> {d.entity.id} ({title})")
@@ -126,17 +178,15 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
     return 0
 
 # ─────────────── Encaminhar/cópia com fallback (ENVIO PELA SUA SESSÃO) ───────────────
-async def forward_with_fallback(m: Message, header: str):
+async def forward_with_fallback(m: Message, header: str, reply_to_msg_id: Optional[int] = None):
     # 1) header
     try:
-        await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown')
+        await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown', reply_to=reply_to_msg_id)
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
-        await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown')
-    except Exception as e:
-        log.warning(f"[send header] {type(e).__name__}: {e}")
+        await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown', reply_to=reply_to_msg_id)
 
-    # 2) tenta forward (se a conta origem puder)
+    # 2) tenta forward
     try:
         await m.forward_to(DEST_ENTITY)
         return
@@ -149,21 +199,16 @@ async def forward_with_fallback(m: Message, header: str):
     try:
         if m.media:
             path = await m.download_media()
-            await SENDER.send_file(DEST_ENTITY, path, caption=(m.text or ''))
+            await SENDER.send_file(DEST_ENTITY, path, caption=(m.text or ''), reply_to=reply_to_msg_id)
         else:
-            await SENDER.send_message(DEST_ENTITY, m.text or '')
+            await SENDER.send_message(DEST_ENTITY, m.text or '', reply_to=reply_to_msg_id)
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
-        try:
-            if m.media:
-                path = await m.download_media()
-                await SENDER.send_file(DEST_ENTITY, path, caption=(m.text or ''))
-            else:
-                await SENDER.send_message(DEST_ENTITY, m.text or '')
-        except Exception as e:
-            log.warning(f"[fallback resend] {type(e).__name__}: {e}")
-    except Exception as e:
-        log.warning(f"[fallback] {type(e).__name__}: {e}")
+        if m.media:
+            path = await m.download_media()
+            await SENDER.send_file(DEST_ENTITY, path, caption=(m.text or ''), reply_to=reply_to_msg_id)
+        else:
+            await SENDER.send_message(DEST_ENTITY, m.text or '', reply_to=reply_to_msg_id)
 
 # ─────────────── Admin: canais fixos (sua session) ───────────────
 @admin_client.on(events.NewMessage)
@@ -213,8 +258,6 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
             except Exception as e:
                 log.info(f"[expand] uid={uid} base_id={base_id} falha={type(e).__name__}")
 
-    log.info(f"🟢 listener dinâmico ligado para user={uid} allowed={sorted(list(allowed_map[key]))}")
-
     @cli.on(events.NewMessage)
     async def forward_user(ev: events.NewMessage.Event):
         aid = allowed_map.get(key, set())
@@ -257,11 +300,11 @@ async def ui(ev: events.NewMessage.Event):
     if txt in ('/start', '/help'):
         return await reply(
             "👋 *Bem-vindo ao Encaminhador Bot*\n\n"
-            "1⃣ `/myid`\n"
-            "2⃣ `/setsession SUA_SESSION`\n"
-            "3⃣ `/listgroups`\n"
-            "4⃣ `/subscribe GROUP_ID`\n"
-            "5⃣ `/unsubscribe GROUP_ID`\n\n"
+            "1⃣ `/myid` – mostra seu ID\n"
+            "2⃣ `/setsession SUA_SESSION` – salva sua sessão\n"
+            "3⃣ `/listgroups` – lista seus grupos/canais\n"
+            "4⃣ `/subscribe GROUP_ID` – assina um grupo seu\n"
+            "5⃣ `/unsubscribe GROUP_ID` – remove assinatura\n\n"
             "🔧 *Admin*\n"
             "`/admin_set_session USER_ID SESSION`\n"
             "`/admin_subscribe USER_ID GROUP_ID`\n"
@@ -279,6 +322,7 @@ async def ui(ev: events.NewMessage.Event):
         sess = txt.split(' ', 1)[1].strip()
         sessions[str(uid)] = sess
         _save_json(SESS_FILE, sessions)
+        log.info(f"[sessions] saved to {SESS_FILE} keys={list(sessions.keys())}")
         await reply("✅ Session salva! Agora use `/listgroups`.")
         await ensure_client(uid)
         return
@@ -335,6 +379,7 @@ async def ui(ev: events.NewMessage.Event):
             _, u, sess = txt.split(' ', 2)
             sessions[u] = sess
             _save_json(SESS_FILE, sessions)
+            log.info(f"[sessions] saved to {SESS_FILE} keys={list(sessions.keys())}")
             await ensure_client(int(u))
             return await reply(f"✅ Session de `{u}` registrada e listener ativo.", parse_mode='Markdown')
         except Exception:
@@ -432,29 +477,22 @@ async def main():
         admin_client.start()
     )
 
-    # Resolver o destino **como InputPeer pela SUA sessão** (evita erro PeerChannel)
+    # Resolver o destino **com a sua sessão**
     global DEST_ENTITY
     try:
-        DEST_ENTITY = await SENDER.get_input_entity(DEST_CHAT_ID)
-    except Exception as e:
-        log.warning(f"[resolve dest] {type(e).__name__}: {e}; usando id literal")
-        DEST_ENTITY = DEST_CHAT_ID
+        DEST_ENTITY = await SENDER.get_entity(DEST_CHAT_ID)
+    except Exception:
+        DEST_ENTITY = DEST_CHAT_ID  # fallback literal
 
-    # 🔁 restaura listeners dinâmicos de todo mundo que já tem session + assinatura
-    active_uids = []
-    for u, sess in sessions.items():
-        if not sess:
-            continue
-        if subscriptions.get(str(u)):     # só quem tem grupos assinados
+    # Restaura listeners para todas as sessions salvas
+    if sessions:
+        to_restore = [int(u) for u in sessions.keys() if str(u).isdigit()]
+        log.info(f"♻️ restaurando listeners dinâmicos: {to_restore}")
+        for u in to_restore:
             try:
-                await ensure_client(int(u))
-                active_uids.append(int(u))
+                await ensure_client(u)
             except Exception as e:
-                log.warning(f"[restore] falha ao ligar listener de {u}: {type(e).__name__}")
-    if active_uids:
-        log.info(f"♻️ restaurados listeners dinâmicos: {active_uids}")
-    else:
-        log.info("♻️ nenhum listener dinâmico para restaurar")
+                log.warning(f"listener restore fail uid={u}: {type(e).__name__}")
 
     log.info("🤖 Bot iniciado!")
     await asyncio.gather(
