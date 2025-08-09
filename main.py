@@ -1,4 +1,4 @@
-# main.py — estável (posts), destino resolvido como InputPeer pela sua sessão
+# main.py — estável (apenas posts). Restaura listeners dinâmicos no startup.
 
 import os
 import json
@@ -127,7 +127,7 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
 
 # ─────────────── Encaminhar/cópia com fallback (ENVIO PELA SUA SESSÃO) ───────────────
 async def forward_with_fallback(m: Message, header: str):
-    # 1) header (pela SUA sessão e já com InputPeer)
+    # 1) header
     try:
         await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown')
     except errors.FloodWaitError as e:
@@ -136,7 +136,7 @@ async def forward_with_fallback(m: Message, header: str):
     except Exception as e:
         log.warning(f"[send header] {type(e).__name__}: {e}")
 
-    # 2) tenta forward (usa o client do PRÓPRIO m; se não tiver acesso, cai no fallback)
+    # 2) tenta forward (se a conta origem puder)
     try:
         await m.forward_to(DEST_ENTITY)
         return
@@ -145,7 +145,7 @@ async def forward_with_fallback(m: Message, header: str):
     except Exception:
         pass
 
-    # 3) fallback: download + reenvio pela SUA sessão
+    # 3) fallback: download + reenvio
     try:
         if m.media:
             path = await m.download_media()
@@ -212,6 +212,8 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
                     allowed_map[key].add(linked)
             except Exception as e:
                 log.info(f"[expand] uid={uid} base_id={base_id} falha={type(e).__name__}")
+
+    log.info(f"🟢 listener dinâmico ligado para user={uid} allowed={sorted(list(allowed_map[key]))}")
 
     @cli.on(events.NewMessage)
     async def forward_user(ev: events.NewMessage.Event):
@@ -430,13 +432,29 @@ async def main():
         admin_client.start()
     )
 
-    # Resolver o destino **como InputPeer pela SUA sessão** (evita o erro PeerChannel)
+    # Resolver o destino **como InputPeer pela SUA sessão** (evita erro PeerChannel)
     global DEST_ENTITY
     try:
         DEST_ENTITY = await SENDER.get_input_entity(DEST_CHAT_ID)
     except Exception as e:
         log.warning(f"[resolve dest] {type(e).__name__}: {e}; usando id literal")
-        DEST_ENTITY = DEST_CHAT_ID  # último recurso
+        DEST_ENTITY = DEST_CHAT_ID
+
+    # 🔁 restaura listeners dinâmicos de todo mundo que já tem session + assinatura
+    active_uids = []
+    for u, sess in sessions.items():
+        if not sess:
+            continue
+        if subscriptions.get(str(u)):     # só quem tem grupos assinados
+            try:
+                await ensure_client(int(u))
+                active_uids.append(int(u))
+            except Exception as e:
+                log.warning(f"[restore] falha ao ligar listener de {u}: {type(e).__name__}")
+    if active_uids:
+        log.info(f"♻️ restaurados listeners dinâmicos: {active_uids}")
+    else:
+        log.info("♻️ nenhum listener dinâmico para restaurar")
 
     log.info("🤖 Bot iniciado!")
     await asyncio.gather(

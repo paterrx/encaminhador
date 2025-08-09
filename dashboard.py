@@ -1,66 +1,78 @@
-import os
-import json
-import requests
-import streamlit as st
+# dashboard.py
+import os, json, requests, streamlit as st
 
-# URL do seu serviço Flask (verifique WORKER_URL em Vars do Railway)
-WEB_URL = os.environ.get('WORKER_URL', 'http://localhost:5000')
-REQUEST_TIMEOUT = 5  # segundos
+# Config de onde buscar (usa o Flask do main)
+WEB_URL = os.environ.get('WORKER_URL', 'http://localhost:8080')
 
-# --- Carrega inscrições dinâmicas via API Flask ---
-try:
-    resp = requests.get(f"{WEB_URL}/dump_subs", timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    SUBS = resp.json()
-except Exception:
-    SUBS = {}
+st.set_page_config(page_title="Dashboard Admin — Encaminhador", layout="wide")
+st.title("📊 Dashboard Admin — Encaminhador")
 
-# --- Carrega audit trail via API Flask ---
-try:
-    resp = requests.get(f"{WEB_URL}/dump_audit", timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    AUDIT = resp.json()
-except Exception:
-    AUDIT = []
+# Helpers HTTP (com timeout pra não travar a página)
+def get_json(path, default):
+    try:
+        r = requests.get(f"{WEB_URL}{path}", timeout=5)
+        if r.ok:
+            return r.json()
+    except Exception:
+        pass
+    return default
 
-# --- Canais fixos da ENV ---
-try:
-    FIXED = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
-except json.JSONDecodeError:
-    FIXED = []
+# Carregamentos
+fixed_ids = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
+subs_map  = get_json('/dump_subs', {})
+sessions  = get_json('/dump_sessions', {})   # novo endpoint sanitizado
 
-# --- UI Streamlit ---
-st.set_page_config(
-    page_title="Dashboard Admin — Encaminhador",
-    layout="wide"
-)
-st.title("🚀 Dashboard Admin — Encaminhador")
-
+# ───────────────── Canais Fixos ─────────────────
 st.header("🔒 Canais Fixos")
-if not FIXED:
-    st.info("Nenhum canal fixo.")
+if not fixed_ids:
+    st.info("Nenhum canal fixo configurado.")
 else:
-    for cid in FIXED:
-        st.write(f"- `{cid}`")
+    for cid in fixed_ids:
+        st.code(str(cid))
 
 st.markdown("---")
+
+# ───────────────── Dinâmicos ─────────────────
 st.header("✨ Canais Dinâmicos (inscritos pelos usuários)")
-dynamic_ids = sorted({g for lst in SUBS.values() for g in lst})
-if not dynamic_ids:
-    st.info("Nenhuma inscrição dinâmica no momento.")
+dyn = sorted({gid for lst in subs_map.values() for gid in lst}) if subs_map else []
+if not dyn:
+    st.info("Nenhuma inscrição dinâmica.")
 else:
-    for cid in dynamic_ids:
-        st.write(f"- `{cid}`")
+    st.write(dyn)
 
 st.markdown("---")
-st.header("📋 Audit Trail (últimos 50 eventos)")
-if not AUDIT:
+
+# ───────────────── Sessões salvas ─────────────────
+st.header("🔑 Sessões salvas (por usuário)")
+if not sessions:
+    st.info("Nenhuma String Session salva.")
+else:
+    # monta uma grade com informações úteis
+    rows = []
+    for uid, meta in sessions.items():
+        rows.append({
+            "User ID": int(uid),
+            "Assinaturas?": "Sim" if meta.get("has_subs") else "Não",
+            "Preview": meta.get("preview", "…"),
+            "Fingerprint": meta.get("fingerprint", ""),
+            "Tamanho": meta.get("length", 0),
+        })
+    # ordena por User ID
+    rows.sort(key=lambda r: r["User ID"])
+    st.dataframe(rows, use_container_width=True)
+
+st.markdown("---")
+
+# ───────────────── Audit Trail ─────────────────
+st.header("🧾 Audit Trail (últimos eventos)")
+audit = get_json('/dump_audit', [])
+if not audit:
     st.info("Nenhum evento registrado ainda.")
 else:
-    # exibe apenas os últimos 50
-    for ev in AUDIT[-50:]:
-        timestamp = ev.get('when', '')
-        tipo      = ev.get('type', '')
-        cid       = ev.get('cid', '')
-        status    = ev.get('ok', '')
-        st.write(f"- {timestamp} · **{tipo}** · `{cid}` · `{status}`")
+    # Mostra só alguns campos se existirem
+    def fmt(ev):
+        ts = ev.get('ts')
+        kind = ev.get('kind') or ev.get('type') or 'event'
+        msg = ev.get('msg') or ev.get('note') or ''
+        return f"{ts}  •  {kind}  •  {msg}"
+    st.write("\n".join(fmt(e) for e in audit[-50:]))
