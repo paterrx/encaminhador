@@ -16,24 +16,25 @@ from telethon.tl.types import Message
 # ───────────────────────────── CONFIG ─────────────────────────────
 API_ID          = int(os.environ['TELEGRAM_API_ID'])
 API_HASH        = os.environ['TELEGRAM_API_HASH']
-BOT_TOKEN       = os.environ['BOT_TOKEN']                # só DM/comandos
-DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])        # canal destino (posts)
+BOT_TOKEN       = os.environ['BOT_TOKEN']                 # só DM/comandos
+DEST_CHAT_ID    = int(os.environ['DEST_CHAT_ID'])         # canal destino (posts)
+DEST_DISCUSS_ID = int(os.environ.get('DEST_DISCUSS_ID', '0') or 0)  # opcional
 
-# Opcional (não usamos para envio; mantido só p/ futura feature)
-DEST_DISCUSS_ID = int(os.environ.get('DEST_DISCUSS_ID', '0') or 0)
-
-# Admin (sua conta) — escuta canais fixos e ENVIA para o destino
+# Sua conta (envia e ouve fixos)
 SESSION_STRING  = os.environ['SESSION_STRING']
 SOURCE_CHAT_IDS = json.loads(os.environ.get('SOURCE_CHAT_IDS', '[]'))
 
-# Flag: incluir automaticamente os chats vinculados aos dinâmicos
+# Dinâmicos
 INCLUDE_LINKED_DYNAMIC = bool(int(os.environ.get('INCLUDE_LINKED_DYNAMIC', '1')))
+POLL_INTERVAL_SEC      = int(os.environ.get('POLL_INTERVAL_SEC', '6'))   # intervalo do poller
+POLL_LIMIT_PER_CHAT    = int(os.environ.get('POLL_LIMIT_PER_CHAT', '8')) # msgs por rodada/por chat
 
 # Persistência
-DATA_DIR  = '/data'
-SESS_FILE = os.path.join(DATA_DIR, 'sessions.json')
-SUBS_FILE = os.path.join(DATA_DIR, 'subscriptions.json')
-AUD_FILE  = os.path.join(DATA_DIR, 'audit.json')
+DATA_DIR   = '/data'
+SESS_FILE  = os.path.join(DATA_DIR, 'sessions.json')
+SUBS_FILE  = os.path.join(DATA_DIR, 'subscriptions.json')
+AUD_FILE   = os.path.join(DATA_DIR, 'audit.json')
+LAST_FILE  = os.path.join(DATA_DIR, 'last_seen.json')  # uid -> chat_id -> last_msg_id
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -41,7 +42,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("encaminhador")
 
-# ─────────────────────── UTIL: JSON persistente ───────────────────────
+# ─────────────────────── JSON util ───────────────────────
 def _load_json(path: str, default):
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -57,6 +58,18 @@ def _save_json(path: str, data):
 sessions: Dict[str, str]            = _load_json(SESS_FILE, {})
 subscriptions: Dict[str, List[int]] = _load_json(SUBS_FILE, {})
 audit: List[dict]                   = _load_json(AUD_FILE, [])
+last_seen: Dict[str, Dict[str, int]] = _load_json(LAST_FILE, {})
+
+def last_get(uid: str, chat_id: int) -> int:
+    return int(last_seen.get(uid, {}).get(str(chat_id), 0))
+
+def last_set(uid: str, chat_id: int, mid: int):
+    if uid not in last_seen:
+        last_seen[uid] = {}
+    prev = int(last_seen[uid].get(str(chat_id), 0))
+    if mid > prev:
+        last_seen[uid][str(chat_id)] = int(mid)
+        _save_json(LAST_FILE, last_seen)
 
 def audit_push(event: dict):
     event['ts'] = int(time.time())
@@ -68,16 +81,13 @@ def audit_push(event: dict):
 app = Flask("keep_alive")
 
 @app.route("/")
-def home():
-    return "OK"
+def home(): return "OK"
 
 @app.route("/dump_subs")
-def dump_subs():
-    return jsonify(subscriptions)
+def dump_subs(): return jsonify(subscriptions)
 
 @app.route("/dump_audit")
-def dump_audit():
-    return jsonify(audit)
+def dump_audit(): return jsonify(audit)
 
 def _sanitize_sessions_dict(d: dict) -> dict:
     out = {}
@@ -99,7 +109,6 @@ def _sanitize_sessions_dict(d: dict) -> dict:
 
 @app.route("/dump_sessions")
 def dump_sessions():
-    # Lê do DISCO (não depende do dicionário em memória)
     on_disk = _load_json(SESS_FILE, {})
     return jsonify(_sanitize_sessions_dict(on_disk))
 
@@ -118,26 +127,23 @@ def dump_state():
     return jsonify({
         "sess_file": stat(SESS_FILE),
         "subs_file": stat(SUBS_FILE),
+        "last_file": stat(LAST_FILE),
         "mem_sessions": len(sessions),
         "mem_subscriptions": len(subscriptions),
-        "active_listeners": list(user_clients.keys()) if 'user_clients' in globals() else [],
     })
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
 
 # ─────────────────────── Telethon clients ───────────────────────
-# bot: PV/comandos (não posta no canal)
-bot = TelegramClient("bot_session", API_ID, API_HASH)
-
-# sua conta (admin): escuta fixos e envia
+bot = TelegramClient("bot_session", API_ID, API_HASH)  # só comandos
 admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 # Quem envia de fato
 SENDER = admin_client
-DEST_ENTITY: Optional[object] = None  # cache do destino resolvido pelo SENDER
+DEST_ENTITY: Optional[object] = None
 
-# ─────────────── Descoberta de chat vinculado (para dinâmicos se habilitado) ───────────────
+# ─────────────── Descoberta de chat vinculado ───────────────
 async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
     try:
         ent = await client.get_entity(channel_id)
@@ -145,7 +151,6 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
         log.debug(f"[linked] get_entity fail {channel_id}: {e}")
         return 0
 
-    # 1) API oficial
     try:
         req_cls = getattr(functions.channels, 'GetFullChannel', None)
         if req_cls is not None:
@@ -159,7 +164,7 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
     except Exception as e:
         log.debug(f"[linked] API resolve failed for {channel_id}: {e}")
 
-    # 2) fallback por nome (ex.: "<canal> chat"), assumindo que o user está no chat
+    # fallback por nome
     try:
         base = (getattr(ent, 'title', '') or '').strip().lower()
         if not base:
@@ -177,16 +182,14 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
         log.debug(f"[linked] name fallback failed for {channel_id}: {e}")
     return 0
 
-# ─────────────── Encaminhar/cópia com fallback (ENVIO PELA SUA SESSÃO) ───────────────
+# ─────────────── Encaminhar com fallback (pela SUA sessão) ───────────────
 async def forward_with_fallback(m: Message, header: str, reply_to_msg_id: Optional[int] = None):
-    # 1) header
     try:
         await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown', reply_to=reply_to_msg_id)
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
         await SENDER.send_message(DEST_ENTITY, header, parse_mode='Markdown', reply_to=reply_to_msg_id)
 
-    # 2) tenta forward
     try:
         await m.forward_to(DEST_ENTITY)
         return
@@ -195,7 +198,6 @@ async def forward_with_fallback(m: Message, header: str, reply_to_msg_id: Option
     except Exception:
         pass
 
-    # 3) fallback: download + reenvio
     try:
         if m.media:
             path = await m.download_media()
@@ -210,7 +212,7 @@ async def forward_with_fallback(m: Message, header: str, reply_to_msg_id: Option
         else:
             await SENDER.send_message(DEST_ENTITY, m.text or '', reply_to=reply_to_msg_id)
 
-# ─────────────── Admin: canais fixos (sua session) ───────────────
+# ─────────────── FIXOS (sua conta) ───────────────
 @admin_client.on(events.NewMessage)
 async def _fixed_listener(ev: events.NewMessage.Event):
     cid = ev.chat_id
@@ -221,8 +223,9 @@ async def _fixed_listener(ev: events.NewMessage.Event):
     title = getattr(chat, 'title', None) or str(cid)
     header = f"📢 *{title}* (`{cid}`)"
     await forward_with_fallback(ev.message, header)
+    # não mexe em last_seen para fixos
 
-# ─────────────── Usuários dinâmicos ───────────────
+# ─────────────── DINÂMICOS ───────────────
 user_clients: Dict[str, TelegramClient] = {}
 allowed_map: Dict[str, set] = {}   # uid -> set(chat_ids permitidos, incluindo linked)
 
@@ -258,17 +261,52 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
             except Exception as e:
                 log.info(f"[expand] uid={uid} base_id={base_id} falha={type(e).__name__}")
 
+    log.info(f"🟢 listener dinâmico ligado para user={uid} allowed={sorted(list(allowed_map[key]))}")
+
+    # Handler por evento (rápido)
     @cli.on(events.NewMessage)
     async def forward_user(ev: events.NewMessage.Event):
         aid = allowed_map.get(key, set())
         if ev.chat_id not in aid:
             return
-        log.info(f"🔍 [dynamic] user={uid} got message from chat={ev.chat_id}")
         chat  = await cli.get_entity(ev.chat_id)
         title = getattr(chat, 'title', None) or str(ev.chat_id)
         header = f"📢 *{title}* (`{ev.chat_id}`)"
         await forward_with_fallback(ev.message, header)
+        last_set(key, ev.chat_id, ev.message.id)
 
+    # Poller resiliente (garante entrega mesmo se o evento não vier)
+    async def poller():
+        await asyncio.sleep(3)  # pequeno atraso inicial
+        while True:
+            try:
+                for cid in list(allowed_map.get(key, set())):
+                    try:
+                        min_id = last_get(key, cid)
+                        new_msgs = []
+                        async for m in cli.iter_messages(cid, limit=POLL_LIMIT_PER_CHAT):
+                            if m.id <= min_id:
+                                break
+                            new_msgs.append(m)
+                        if new_msgs:
+                            for m in reversed(new_msgs):  # ordem cronológica
+                                chat  = await cli.get_entity(cid)
+                                title = getattr(chat, 'title', None) or str(cid)
+                                header = f"📢 *{title}* (`{cid}`)"
+                                await forward_with_fallback(m, header)
+                                last_set(key, cid, m.id)
+                    except errors.FloodWaitError as e:
+                        await asyncio.sleep(e.seconds + 1)
+                    except Exception as e:
+                        log.debug(f"[poller] uid={uid} chat={cid} erro={type(e).__name__}")
+                await asyncio.sleep(POLL_INTERVAL_SEC)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.debug(f"[poller] loop uid={uid} erro={type(e).__name__}")
+                await asyncio.sleep(POLL_INTERVAL_SEC)
+
+    asyncio.create_task(poller())
     asyncio.create_task(cli.run_until_disconnected())
     return cli
 
@@ -468,23 +506,20 @@ async def ui(ev: events.NewMessage.Event):
 
 # ─────────────── MAIN ───────────────
 async def main():
-    # Flask
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # inicia bot + sua conta
     await asyncio.gather(
         bot.start(bot_token=BOT_TOKEN),
         admin_client.start()
     )
 
-    # Resolver o destino **com a sua sessão**
     global DEST_ENTITY
     try:
         DEST_ENTITY = await SENDER.get_entity(DEST_CHAT_ID)
     except Exception:
-        DEST_ENTITY = DEST_CHAT_ID  # fallback literal
+        DEST_ENTITY = DEST_CHAT_ID
 
-    # Restaura listeners para todas as sessions salvas
+    # Restaura listeners dinâmicos para TODAS as sessions salvas
     if sessions:
         to_restore = [int(u) for u in sessions.keys() if str(u).isdigit()]
         log.info(f"♻️ restaurando listeners dinâmicos: {to_restore}")
