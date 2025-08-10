@@ -33,6 +33,8 @@ DATA_DIR   = '/data'
 SESS_FILE  = os.path.join(DATA_DIR, 'sessions.json')
 SUBS_FILE  = os.path.join(DATA_DIR, 'subscriptions.json')
 AUD_FILE   = os.path.join(DATA_DIR, 'audit.json')
+POSTMAP_MAIN_FILE     = os.path.join(DATA_DIR, 'postmap_main.json')      # canal principal
+POSTMAP_COMMENTS_FILE = os.path.join(DATA_DIR, 'postmap_comments.json')  # canal de chats
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ───────────────────────────── LOG ─────────────────────────────
@@ -55,12 +57,25 @@ def _save_json(path: str, data):
 sessions: Dict[str, str]            = _load_json(SESS_FILE, {})
 subscriptions: Dict[str, List[int]] = _load_json(SUBS_FILE, {})
 audit: List[dict]                   = _load_json(AUD_FILE, [])
+postmap_main: Dict[str, int]        = _load_json(POSTMAP_MAIN_FILE, {})
+postmap_comments: Dict[str, int]    = _load_json(POSTMAP_COMMENTS_FILE, {})
 
 def audit_push(event: dict):
     event['ts'] = int(time.time())
     audit.append(event)
     del audit[:-500]
     _save_json(AUD_FILE, audit)
+
+def post_key(src_chat_id: int, src_msg_id: int) -> str:
+    return f"{int(src_chat_id)}:{int(src_msg_id)}"
+
+def map_store_main(src_chat_id: int, src_msg_id: int, dest_msg_id: int):
+    postmap_main[post_key(src_chat_id, src_msg_id)] = int(dest_msg_id)
+    _save_json(POSTMAP_MAIN_FILE, postmap_main)
+
+def map_store_comments(src_chat_id: int, src_msg_id: int, dest_msg_id: int):
+    postmap_comments[post_key(src_chat_id, src_msg_id)] = int(dest_msg_id)
+    _save_json(POSTMAP_COMMENTS_FILE, postmap_comments)
 
 # ─────────────────────── normalização de IDs ───────────────────────
 def normalize_gid(gid: int) -> int:
@@ -97,33 +112,27 @@ def dump_subs(): return jsonify(subscriptions)
 @app.route("/dump_audit")
 def dump_audit(): return jsonify(audit)
 
-def _sanitize_sessions_dict(d: dict) -> dict:
-    out = {}
-    for uid, sess in (d or {}).items():
-        if not sess: continue
-        try:
-            fp = hashlib.sha256(sess.encode("utf-8")).hexdigest()[:10]
-            prev = f"{sess[:6]}…{sess[-6:]}" if len(sess) >= 14 else "…"
-            out[str(uid)] = {"fingerprint": fp, "preview": prev, "length": len(sess), "has_subs": bool(subscriptions.get(str(uid)))}
-        except Exception:
-            pass
-    return out
-
 @app.route("/dump_sessions")
-def dump_sessions(): return jsonify(_sanitize_sessions_dict(_load_json(SESS_FILE, {})))
+def dump_sessions():
+    out = {}
+    for uid, sess in sessions.items():
+        if not sess: continue
+        fp = hashlib.sha256(sess.encode("utf-8")).hexdigest()[:10]
+        prev = f"{sess[:6]}…{sess[-6:]}" if len(sess) >= 14 else "…"
+        out[str(uid)] = {"fingerprint": fp, "preview": prev, "length": len(sess), "has_subs": bool(subscriptions.get(str(uid)))}
+    return jsonify(out)
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
 
 # ─────────────────────── Telethon clients ───────────────────────
 bot = TelegramClient("bot_session", API_ID, API_HASH)  # comandos em PV
-
-admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)  # sua conta
+admin_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)  # sua conta (envia)
 
 # Quem envia:
 SENDER = admin_client
 DEST_POSTS_ENTITY: Optional[object] = None
-DEST_COMMENTS_ENTITY: Optional[object] = None  # None = indisponível/desabilitado
+DEST_COMMENTS_ENTITY: Optional[object] = None  # None = desabilitado
 
 # DEDUPE de mensagens
 DEDUP_MAX = 5000
@@ -133,10 +142,13 @@ def seen(chat_id: int, msg_id: int) -> bool:
     if key in _seen: return True
     _seen.add(key)
     if len(_seen) > DEDUP_MAX:
-        for _ in range(len(_seen) - DEDUP_MAX):
-            try: _seen.pop()
-            except KeyError: break
+        # esvazia um pouco (estrutura simples o suficiente aqui)
+        _seen.clear()
+        _seen.add(key)
     return False
+
+# mapeamento discuss→base (para responder no post certo)
+DISCUSS_TO_BASE: Dict[int, int] = {}
 
 # ─────────────── Descoberta de chat vinculado (opcional) ───────────────
 async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
@@ -154,60 +166,139 @@ async def resolve_linked_for(client: TelegramClient, channel_id: int) -> int:
             full = await client(GetFullChannelRequest(channel=ent))
         lc = getattr(full.full_chat, 'linked_chat_id', None)
         if lc:
-            return int(f"-100{lc}") if lc > 0 else int(lc)
+            linked_id = int(f"-100{lc}") if lc > 0 else int(lc)
+            DISCUSS_TO_BASE[linked_id] = int(channel_id)
+            return linked_id
     except Exception:
         pass
     return 0
 
-# ─────────────── envio com fallback ───────────────
-async def send_with_fallback(dest_entity, m: Message, header: str):
-    # header
+# ─────────────── envio com fallback (RETORNA o id do post enviado) ───────────────
+async def send_with_fallback(dest_entity, m: Message, header: str) -> Optional[int]:
     try:
         await SENDER.send_message(dest_entity, header, parse_mode='Markdown')
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
         await SENDER.send_message(dest_entity, header, parse_mode='Markdown')
 
-    # forward original
+    # forward
     try:
-        await m.forward_to(dest_entity)
-        return
+        sent = await m.forward_to(dest_entity)
+        # pode vir lista; pegamos o primeiro Message
+        if isinstance(sent, list) and sent:
+            return sent[0].id
+        elif sent:
+            return sent.id
+        return None
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
     except Exception:
         pass
 
-    # baixar/repostar
+    # reenvio
     try:
         if m.media:
             path = await m.download_media()
-            await SENDER.send_file(dest_entity, path, caption=(m.text or ''))
+            sent = await SENDER.send_file(dest_entity, path, caption=(m.text or ''))
+            return sent.id if sent else None
         else:
-            await SENDER.send_message(dest_entity, m.text or '')
+            sent = await SENDER.send_message(dest_entity, m.text or '')
+            return sent.id if sent else None
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
         if m.media:
             path = await m.download_media()
-            await SENDER.send_file(dest_entity, path, caption=(m.text or ''))
+            sent = await SENDER.send_file(dest_entity, path, caption=(m.text or ''))
+            return sent.id if sent else None
         else:
-            await SENDER.send_message(dest_entity, m.text or '')
+            sent = await SENDER.send_message(dest_entity, m.text or '')
+            return sent.id if sent else None
+
+# ─────────────── helpers de autor + reply_to_top ───────────────
+async def display_name_of(client: TelegramClient, sender_id: Optional[int]) -> str:
+    try:
+        if not sender_id:
+            return "Desconhecido"
+        ent = await client.get_entity(sender_id)
+        name = " ".join(filter(None, [getattr(ent, 'first_name', None), getattr(ent, 'last_name', None)])).strip()
+        if not name and getattr(ent, 'username', None):
+            name = f"@{ent.username}"
+        return name or f"ID {sender_id}"
+    except Exception:
+        return f"ID {sender_id}"
+
+def get_top_id(msg: Message) -> Optional[int]:
+    # tenta reply_to_top_id; se não, reply_to_msg_id
+    try:
+        if getattr(msg, 'reply_to', None) and getattr(msg.reply_to, 'reply_to_top_id', None):
+            return int(msg.reply_to.reply_to_top_id)
+    except Exception:
+        pass
+    try:
+        if getattr(msg, 'reply_to_top_id', None):
+            return int(msg.reply_to_top_id)
+    except Exception:
+        pass
+    try:
+        if getattr(msg, 'reply_to_msg_id', None):
+            return int(msg.reply_to_msg_id)
+    except Exception:
+        pass
+    return None
 
 # ─────────────── FIXOS (sua sessão) ───────────────
 @admin_client.on(events.NewMessage)
 async def fixed_listener(ev: events.NewMessage.Event):
     cid = ev.chat_id
     if cid not in SOURCE_CHAT_IDS:
+        # se for chat vinculado de algum fixo, tratamos num handler separado abaixo
         return
-    # garantimos que mensagens de CHAT não vão pro principal
     if ev.is_group:
         return
     if seen(cid, ev.message.id):
         return
-    log.info(f"🔍 [fixed] got message in fixed chat={cid}")
+
     chat  = await admin_client.get_entity(cid)
     title = getattr(chat, 'title', None) or str(cid)
     header = f"📢 *{title}* (`{cid}`)"
-    await send_with_fallback(DEST_POSTS_ENTITY, ev.message, header)
+
+    # envia post para PRINCIPAL
+    dest_main_id = await send_with_fallback(DEST_POSTS_ENTITY, ev.message, header)
+    if dest_main_id:
+        map_store_main(cid, ev.message.id, dest_main_id)
+
+    # espelha o post no canal de CHATS (ancora para replies)
+    if DEST_COMMENTS_ENTITY is not None:
+        dest_comm_id = await send_with_fallback(DEST_COMMENTS_ENTITY, ev.message, header)
+        if dest_comm_id:
+            map_store_comments(cid, ev.message.id, dest_comm_id)
+
+# Chats vinculados dos FIXOS
+@admin_client.on(events.NewMessage)
+async def fixed_discuss_listener(ev: events.NewMessage.Event):
+    if not ev.is_group:
+        return
+    if seen(ev.chat_id, ev.message.id):
+        return
+    base_id = DISCUSS_TO_BASE.get(int(ev.chat_id))
+    if not base_id:
+        return  # não é chat vinculado conhecido
+    if DEST_COMMENTS_ENTITY is None:
+        return
+
+    # localizar o post correto para reply
+    top = get_top_id(ev.message)
+    reply_to = None
+    if top:
+        reply_to = postmap_comments.get(post_key(base_id, top))
+
+    author = await display_name_of(admin_client, ev.sender_id)
+    prefix = f"**{author}:** "
+    if ev.message.media:
+        path = await ev.message.download_media()
+        await SENDER.send_file(DEST_COMMENTS_ENTITY, path, caption=prefix + (ev.message.text or ""), reply_to=reply_to)
+    else:
+        await SENDER.send_message(DEST_COMMENTS_ENTITY, prefix + (ev.message.text or ""), reply_to=reply_to)
 
 # ─────────────── DINÂMICOS ───────────────
 user_clients: Dict[str, TelegramClient] = {}
@@ -233,11 +324,10 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
 
     user_clients[key] = cli
 
-    # base permitidos (normalizados)
     base_allowed = {normalize_gid(int(g)) for g in subscriptions.get(key, [])}
     allowed = set(base_allowed)
 
-    # incluir chat vinculado se habilitado
+    # incluir chat vinculado (e popular DISCUSS_TO_BASE)
     if INCLUDE_LINKED_DYNAMIC and base_allowed:
         for base_id in list(base_allowed):
             try:
@@ -256,18 +346,49 @@ async def ensure_client(uid: int) -> Optional[TelegramClient]:
         if seen(ev.chat_id, ev.message.id):
             return
 
-        chat  = await cli.get_entity(ev.chat_id)
-        title = getattr(chat, 'title', None) or str(ev.chat_id)
-        header = f"📢 *{title}* (`{ev.chat_id}`)"
+        # se for POST (canal), manda para PRINCIPAL + cria mapas
+        if not ev.is_group:
+            chat  = await cli.get_entity(ev.chat_id)
+            title = getattr(chat, 'title', None) or str(ev.chat_id)
+            header = f"📢 *{title}* (`{ev.chat_id}`)"
+            dest_main_id = await send_with_fallback(DEST_POSTS_ENTITY, ev.message, header)
+            if dest_main_id:
+                map_store_main(ev.chat_id, ev.message.id, dest_main_id)
+            if DEST_COMMENTS_ENTITY is not None:
+                dest_comm_id = await send_with_fallback(DEST_COMMENTS_ENTITY, ev.message, header)
+                if dest_comm_id:
+                    map_store_comments(ev.chat_id, ev.message.id, dest_comm_id)
+            return
 
-        # Roteamento:
-        if ev.is_group:
-            if DEST_COMMENTS_ENTITY is None:
-                # comentários desabilitados: ignora
-                return
-            await send_with_fallback(DEST_COMMENTS_ENTITY, ev.message, header)
+        # se for MENSAGEM DE CHAT
+        if DEST_COMMENTS_ENTITY is None:
+            return
+        base_id = DISCUSS_TO_BASE.get(int(ev.chat_id))
+        # se ainda não sabemos o base, tenta descobrir por qualquer base permitido
+        if not base_id:
+            for b in base_allowed:
+                try:
+                    link = await resolve_linked_for(cli, b)
+                    if link:
+                        allowed_map[key].add(link)
+                except Exception:
+                    pass
+            base_id = DISCUSS_TO_BASE.get(int(ev.chat_id))
+            if not base_id:
+                return  # não é um chat vinculado que conhecemos
+
+        top = get_top_id(ev.message)
+        reply_to = None
+        if top:
+            reply_to = postmap_comments.get(post_key(base_id, top))
+
+        author = await display_name_of(cli, ev.sender_id)
+        prefix = f"**{author}:** "
+        if ev.message.media:
+            path = await ev.message.download_media()
+            await SENDER.send_file(DEST_COMMENTS_ENTITY, path, caption=prefix + (ev.message.text or ""), reply_to=reply_to)
         else:
-            await send_with_fallback(DEST_POSTS_ENTITY, ev.message, header)
+            await SENDER.send_message(DEST_COMMENTS_ENTITY, prefix + (ev.message.text or ""), reply_to=reply_to)
 
     asyncio.create_task(cli.run_until_disconnected())
     log.info(f"🟢 listener dinâmico ligado para user={uid} allowed={sorted(list(allowed))}")
@@ -468,6 +589,15 @@ async def main():
     else:
         DEST_COMMENTS_ENTITY = None
         log.info("💬 Clonagem de chat DESABILITADA (DEST_COMMENTS_ID não definido).")
+
+    # popular DISCUSS_TO_BASE para fixos
+    for base in SOURCE_CHAT_IDS:
+        try:
+            linked = await resolve_linked_for(admin_client, base)
+            if linked:
+                log.info(f"[discover] base={base} discuss={linked}")
+        except Exception:
+            pass
 
     # reativar listeners dinâmicos já salvos
     if subscriptions:
