@@ -1,0 +1,92 @@
+[33m8cc5e47[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m fix045
+[33m3d157dd[m fix044
+[33mb8681a3[m fix043
+[33m553944a[m fix042
+[33m186862d[m fix041
+[33m567c53f[m fix040
+[33m4d747a0[m fix037
+[33mbde353f[m fix036
+[33m646462b[m fix035
+[33md688378[m fix034
+[33m8586084[m fix033
+[33m67df87f[m fix032
+[33m6f441ee[m fix031
+[33ma9ace54[m fix030
+[33meff4a9f[m fix029
+[33m95e8cd8[m fix028
+[33mafb2c13[m fix027
+[33m87ac36a[m fix026
+[33mfe68b68[m fix025
+[33md2b212d[m fix024
+[33m80ad734[m fix023
+[33ma6f0c09[m fix022
+[33ma705c3e[m fix021
+[33md671589[m fix020
+[33md5d9c84[m fix020
+[33mb9f0c54[m fix019
+[33md555d2b[m fix018
+[33m218b3a5[m fix017
+[33m94f4dba[m fix016
+[33mab88a39[m fix015
+[33m5d90860[m fix014
+[33mb90ac9b[m fix013
+[33m46bbb19[m fix012
+[33mda44726[m fix011
+[33m95e536a[m fix010
+[33m55db10c[m fix009
+[33ma699f66[m fix008
+[33mb805e06[m fix007
+[33m4425beb[m fix006
+[33mc3fd8bf[m fix005
+[33me24b380[m fix004
+[33m90c5c1e[m fix003
+[33m1a09005[m fix002
+[33m82ce6dd[m fix001
+[33m961d7e7[m fix16
+[33m484d312[m fix15
+[33m0631518[m fix14
+[33m176b493[m fix13
+[33m206cc14[m fix12
+[33m95191c8[m fix11
+[33m8b344c4[m fix10
+[33m388b80a[m fix9
+[33m75e787f[m fix8
+[33m7d84144[m fix6
+[33m3e94c1c[m fix5
+[33m5c44d45[m fix4
+[33mafd0951[m fix3
+[33m1a71d9d[m fix2
+[33m5cdeea6[m fix
+[33me6e8ded[m finalFix
+[33m33c9773[m 🔄 Adota Procfile do planilhadorbotV2: worker + web
+[33mf20ee6a[m 🔄 Unifica bot+dashboard no web process único
+[33m367bf08[m ✨ Adiciona dashboard desacoplado do Telethon; sem experimental rerun
+[33m2935867[m ✨ Adiciona dashboard desacoplado do Telethon; sem experimental rerun
+[33m30c5e26[m 🔄 Corrige dashboard para sync; configura Procfile web+worker
+[33m5b2406b[m ♻️ Usa Telethon.sync no dashboard para evitar event loop
+[33mfa36e8f[m 🔧 Usa forward_to, separa bot e dashboard no Procfile
+[33m6c24ad2[m 🔧 Suppress linter warning on st.experimental_rerun
+[33me440590[m 🔧 Suppress linter warning on st.experimental_rerun
+[33m45b48cb[m 🔧 Corrige parsing e adiciona clonagem de comentários na thread
+[33mcdb8afa[m fix
+[33m256ce70[m 🔧 Corrige main.py: string literal, parsing, loop de eventos
+[33md0bf96c[m final
+[33m1e3c5fc[m ✨ Suporte 2FA: /password; atualiza fluxo Telethon via BotFather-bot2
+[33m44573de[m ✨ Suporte 2FA: /password; atualiza fluxo Telethon via BotFather-bot
+[33m0b4942d[m 🚀 BotFather + Telethon: login, listgroups, subscribe flow
+[33m5b6fd3a[m ✅ Trata caso ADMIN_ID ausente e corrige is_admin
+[33maeaeec3[m TryingT
+[33m008c167[m Delete forward_bot.py
+[33m37427bf[m 🔧 Corrige deploy: remove Telethon, ajusta imports, Procfile p/ bot.py
+[33mb2191b0[m ⚙️ Refatora projeto: mantém apenas bot.py com guia completo, remove código legado
+[33mae11fba[m TratativaV2
+[33mf2fb6c3[m TratativaDeEdicoes
+[33m4d42ad3[m Remove config.py do repositório
+[33m22d3859[m Atualiza .gitignore: ignora config.py, .env e artifacts Python
+[33m8519b4c[m Remove .env do repositório e adiciona ao .gitignore
+[33mbff828f[m Evita duplicar: envia mídia OU texto, não ambos
+[33md39773b[m Trata caso de sender sem first_name (canal)
+[33mf7988aa[m Remove dotenv, ajusta requirements e forward_bot
+[33me412820[m try
+[33m0353d46[m Remove config.py dos commits e adiciona ao .gitignore
+[33mc398210[m Adiciona bot Telethon + Flask + Procfile
