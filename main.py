@@ -1,15 +1,13 @@
-# main.py — BOT único, cópia (sem forward), reply estável por base→chat
+# main.py — hardcoded, envio via BOT, com listagem/assinatura ao vivo
 import os
 import asyncio
 import logging
 import threading
-import time
 from typing import Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, Response
 import html as html_std
-
-from telethon import TelegramClient, events, errors, functions
+from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import Message
 
@@ -18,36 +16,35 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message
 log = logging.getLogger("encaminhador")
 
 # ───────────────────────────── HARD-CODE CONFIG ─────────────────────────────
-# DESTINOS
+# Destinos
 DEST_POSTS: int = -1002897690215      # canal de POSTS
 DEST_COMMENTS: int = -1002489338128   # canal de CHAT/clonagem de comentários
 
-# PARES base→chat (apenas estes 3)
+# Pares base→chat (o que já sabemos)
 LINKS: Dict[int, int] = {
     -1002794084735: -1002722732606,  # TRIADE
     -1002855377727: -1002813556527,  # LF Tips
     -1002468014496: -1002333613791,  # Psico
 }
-INV_LINKS: Dict[int, int] = {v: k for k, v in LINKS.items()}
 
-# SESSÕES (ouvir)
+# Strings de sessão (donos)
 SESSIONS: Dict[str, str] = {
     "786880968": "1AZWarzgBu1SEPUzUrUUDXtnGbkyoDEknN2-8Pfcae8iOjJNEQ6qryf1VY47_IYDt0urjMxZCvnQS6X6CNO7WRmKID2YVdRHkIm-1MWX_4NCQQPzMrlN8OsdCF-JaIx4Pt3vXhfbx1qR68ISM9yLTx8-Ud9wy5xtb1DRYRB95IzV5bimJLTEP_9N8Og7rANevX4H29_NKZkCoTA7Qg8jTeVPgK0I6ClQvVbcaxi04kiZ9vwfjsOx3YwWbZsWFLFovQRjnGezXWVPn3BxfRWiHE1sHOM8X6qsEwnWsmdjkyTDxzg8sTjLYs8Bnapw275LhRwCscROeGQ-YmvlzHZ4AqB7JyFRnfH4=",
     "435374422": "1AZWarzsBu7Rd3aDhcqB9VW1tW9nPh-UVr8HMPCwEKBh_jVQ4wAaYx8xd4ZEltEJTsUJyNWAbPSeT61ZZJGxg6vPBXfXYWaCoylT2rBullBn0ZG1VXofd4jO-tGOPy8LYb9xBvmVkmuPILGN0_ZJsz92is901v2Eys4o5ULHrp2TT9o6jwU1rFKYpv0T6PdptBrwh2XgdViewk1xjMy1bS0GZD8EltJ8FdaTqXj2DXj96TjAa3nWk1ExUKvnaWW81MytyVMjGzsCgYDeU-Z641a3c29L0iFXXjDq4H7m0-Pxy1tJG5CASlnBv4ShOOToc0W4JFTgkKZp6IF9mWGd9hvNSkSr3XYo=",
     "6209300823": "1AZWarzcBu2MRTYFPOYL8dNP86W39b2XnUIZn4VGhnJsFWuNIL1zSUqLAiBb0zq58HGRmuSsRWkrS4apG9bvRP3gsMgHvwfti0Jp4-KA-tVNdot7tLdn20u5tNY2ZVfqki_xG9VpQqgCmjMpV6___rVZLMy_bHR2IN5a8YIP2ApvANw4p_1Dw-o044FdIgREBGSQ6ONURKj45b_8Nm2y0JcRutNCCH94zAILysNxhQlIdCSahNxfiA78-FGr_fvk7WIPfHHDtVmylNUZMUpu-5UlT9OuLHxazyxDyM9uPTmh8cD3CG7JvY44652m-ajPDPlB4d3MfPIC_95uxJIJhoymrfr4HQoE=",
 }
 
-# ASSINATURAS por dono (apenas base; chat vem de LINKS)
+# Assinaturas por dono (apenas base; o chat vem de LINKS)
 SUBS: Dict[str, List[int]] = {
-    "786880968": [-1002794084735, -1002855377727, -1002468014496],
+    "786880968": [-1002794084735, -1002855377727, -1002468014496],  # triade, lf, psico
     "435374422": [-1002855377727],
     "6209300823": [-1002468014496],
 }
 
-# API + BOT
+# API e Bot
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "0") or 0)
-API_HASH = (os.environ.get("TELEGRAM_API_HASH", "") or "").strip()
-BOT_TOKEN = (os.environ.get("BOT_TOKEN", "") or "").strip()  # @encaminhadorAdmin_bot
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "") or ""
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()  # @encaminhadorAdmin_bot
 
 # ───────────────────────────── Infra web ─────────────────────────────
 app = Flask("keep_alive")
@@ -79,66 +76,67 @@ def dash() -> Response:
     for b, c in LINKS.items():
         rows.append(f"{html_std.escape(str(b))} → {html_std.escape(str(c))}")
     rows.append("</pre>")
-    rows.append("<h3>Últimos posts (base → dest_id, ts)</h3><pre>")
-    for b, info in last_post_by_base.items():
-        rows.append(f"{b} → {info[0]} @ {time.strftime('%H:%M:%S', time.localtime(info[1]))}")
-    rows.append("</pre>")
     return Response("\n".join(rows), mimetype="text/html")
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
 
-# ───────────────────────────── Núcleo ─────────────────────────────
+# ───────────────────────────── Core de envio ─────────────────────────────
 bot_client: Optional[TelegramClient] = None
 user_clients: Dict[str, TelegramClient] = {}
 user_handlers: Dict[str, Tuple] = {}  # uid -> (callback, event_builder)
 
-# Para reply estável: base_id -> (dest_post_msg_id, ts)
-last_post_by_base: Dict[int, Tuple[int, float]] = {}
-
-def is_base(chat_id: int) -> bool:
-    return chat_id in LINKS.keys()
-
-def is_chat(chat_id: int) -> bool:
-    return chat_id in INV_LINKS.keys()
-
-def base_of_chat(chat_id: int) -> Optional[int]:
-    return INV_LINKS.get(chat_id)
+def is_chat_id(chat_id: int) -> bool:
+    return chat_id in LINKS.values()
 
 def dst_for(chat_id: int) -> int:
-    return DEST_COMMENTS if is_chat(chat_id) else DEST_POSTS
+    return DEST_COMMENTS if is_chat_id(chat_id) else DEST_POSTS
 
-async def copy_message(dst: int, m: Message, reply_to: Optional[int] = None) -> Message:
-    """
-    Copia a mensagem (texto com entities; mídia via download/upload).
-    Retorna a mensagem enviada (Message) — usamos o id para mapear reply.
-    """
+async def send_with_fallback(dst: int, m: Message):
+    if not m: # Adiciona uma checagem para evitar erro se a mensagem for nula
+        return
+    try:
+        await m.forward_to(dst)
+        return
+    except errors.FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        try:
+            await m.forward_to(dst)
+            return
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Fallback para baixar e enviar
     try:
         if m.media:
             path = await m.download_media()
-            sent = await bot_client.send_file(dst, path, caption=(m.message or ""), reply_to=reply_to)
+            await bot_client.send_file(dst, path, caption=(m.text or ""))
         else:
-            sent = await bot_client.send_message(dst, m.message or "", entities=m.entities, reply_to=reply_to)
-        return sent
+            await bot_client.send_message(dst, m.text or "")
     except errors.FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
-        return await copy_message(dst, m, reply_to)
+        if m.media:
+            path = await m.download_media()
+            await bot_client.send_file(dst, path, caption=(m.text or ""))
+        else:
+            await bot_client.send_message(dst, m.text or "")
     except Exception as e:
-        log.exception(f"[copy] falhou: {type(e).__name__}: {e}")
-        # último recurso: texto simples
-        txt = m.message or ""
-        return await bot_client.send_message(dst, txt, reply_to=reply_to)
+        log.error(f"Falha total no fallback para a mensagem {m.id}: {e}")
 
 def allowed_for(uid: str) -> List[int]:
     bases = SUBS.get(uid, [])
     s = set(bases)
     for b in bases:
-        c = LINKS.get(b)
-        if c:
-            s.add(c)
+        chat = LINKS.get(b)
+        if chat:
+            s.add(chat)
     return sorted(list(s))
 
-# ─────────────── Listeners por sessão (apenas ouvir) ───────────────
+# ##################################################################
+# ##                 CÓDIGO MODIFICADO ABAIXO                     ##
+# ##################################################################
+
 async def ensure_dynamic(uid: str, force: bool = False) -> Optional[TelegramClient]:
     sess = SESSIONS.get(uid)
     if not sess:
@@ -165,67 +163,50 @@ async def ensure_dynamic(uid: str, force: bool = False) -> Optional[TelegramClie
         async def _cb(ev: events.NewMessage.Event, _uid=uid):
             try:
                 cid = ev.chat_id
+                dest = dst_for(cid)
                 ent = await cli.get_entity(cid)
                 title = getattr(ent, "title", None) or getattr(ent, "username", None) or str(cid)
-                dest = dst_for(cid)
+                
+                # Cria o cabeçalho
+                if is_chat_id(cid):
+                    sender = await ev.get_sender()
+                    sname = " ".join(filter(None, [
+                        getattr(sender, "first_name", None),
+                        getattr(sender, "last_name", None),
+                    ])) or (getattr(sender, "username", None) or "alguém")
+                    header = f"💬 *{title}* — {sname} (`{cid}`)"
+                else:
+                    header = f"📢 *{title}* (`{cid}`)"
 
-                # BASE → publica post + grava mapeamento para replies
-                if is_base(cid):
-                    # cabeçalho
-                    header = f"📣 *{title}* (`{cid}`)"
-                    await bot_client.send_message(DEST_POSTS, header, parse_mode="Markdown")
-                    sent = await copy_message(DEST_POSTS, ev.message, reply_to=None)
-                    last_post_by_base[cid] = (sent.id, time.time())
-                    log.info(f"[base {_uid}] {cid} → {DEST_POSTS} (dest_id={sent.id})")
-                    return
+                # Envia o cabeçalho primeiro
+                await bot_client.send_message(dest, header, parse_mode="Markdown")
+                
+                # ✅ LÓGICA DE RESPOSTA CORRIGIDA
+                # Se a mensagem for uma resposta, busca e envia a mensagem original primeiro
+                if ev.message.is_reply:
+                    replied_to_msg = await ev.get_reply_message()
+                    # Adiciona uma indicação visual de que é uma resposta
+                    await bot_client.send_message(dest, " GGGG")
+                    await send_with_fallback(dest, replied_to_msg)
 
-                # CHAT → responde ao último post da base correspondente
-                if is_chat(cid):
-                    b = base_of_chat(cid)
-                    reply_to_id: Optional[int] = None
-                    if b and b in last_post_by_base:
-                        reply_to_id = last_post_by_base[b][0]
-
-                    # nome do autor na frente do texto
-                    try:
-                        s = await ev.get_sender()
-                        sname = " ".join(filter(None, [getattr(s, "first_name", None), getattr(s, "last_name", None)])) \
-                                or (getattr(s, "username", None) or "alguém")
-                    except Exception:
-                        sname = "alguém"
-
-                    # “cabeçalho inline” (uma única msg): nome + conteúdo copiado
-                    # Se houver mídia, colocamos o nome acima como texto puro
-                    if ev.message.media:
-                        await bot_client.send_message(
-                            DEST_COMMENTS,
-                            f"💬 *{title}* — {sname} (`{cid}`)",
-                            parse_mode="Markdown",
-                            reply_to=reply_to_id
-                        )
-                        await copy_message(DEST_COMMENTS, ev.message, reply_to=reply_to_id)
-                    else:
-                        # prefixar o nome ao corpo mantendo entities do usuário
-                        prefix = f"{sname}: "
-                        body = (ev.message.message or "")
-                        sent = await bot_client.send_message(
-                            DEST_COMMENTS,
-                            prefix + body,
-                            # entities não dá pra “deslocar” facilmente; enviamos sem entities no modo prefixado
-                            reply_to=reply_to_id
-                        )
-                    log.info(f"[chat {_uid}] {cid} → {DEST_COMMENTS} (reply_to={reply_to_id})")
-                    return
+                # Envia a mensagem principal (a resposta em si, ou uma mensagem normal)
+                await send_with_fallback(dest, ev.message)
+                
+                log.info(f"[dyn {_uid}] {cid} -> {dest} (reply: {ev.message.is_reply})")
 
             except Exception as e:
-                log.exception(f"[dyn {_uid}] falha: {type(e).__name__}: {e}")
+                log.exception(f"[dyn {_uid}] fail: {e}")
 
         cli.add_event_handler(_cb, evb)
         user_handlers[uid] = (_cb, evb)
         log.info(f"[dyn] ligado uid={uid} allowed={chats_list}")
     return cli
 
-# ─────────────── BOT de comandos ───────────────
+# ##################################################################
+# ##                 FIM DO CÓDIGO MODIFICADO                     ##
+# ##################################################################
+
+# ───────────────────────────── Bot: comandos ─────────────────────────────
 def parse_int(s: str) -> Optional[int]:
     try:
         return int(s)
@@ -245,16 +226,20 @@ async def listgroups_for(uid: str, page: int, size: int) -> List[str]:
 
     out, grabbed = [], 0
     want = page * size
-    async for dlg in cli.iter_dialogs(limit=3000):
-        ent = dlg.entity
-        if getattr(ent, "megagroup", False) or getattr(ent, "broadcast", False):
-            cid = getattr(ent, "id", None)
-            title = getattr(ent, "title", None) or getattr(ent, "username", None) or str(cid)
-            grabbed += 1
-            if grabbed > (page - 1) * size and len(out) < size:
-                out.append(f"- `{cid}` — {title}")
-            if grabbed >= want:
-                break
+    try:
+        async for dlg in cli.iter_dialogs(limit=3000):
+            ent = dlg.entity
+            if getattr(ent, "megagroup", False) or getattr(ent, "broadcast", False):
+                cid = getattr(ent, "id", None)
+                title = getattr(ent, "title", None) or getattr(ent, "username", None) or str(cid)
+                grabbed += 1
+                if grabbed > (page - 1) * size and len(out) < size:
+                    out.append(f"- `{cid}` — {title}")
+                if len(out) >= size:
+                    break
+    except Exception as e:
+        log.error(f"Erro ao listar dialogs para {uid}: {e}")
+        out.append("Erro ao buscar grupos.")
 
     if temp:
         try:
@@ -268,7 +253,8 @@ async def listgroups_for(uid: str, page: int, size: int) -> List[str]:
 
 async def setup_bot_commands():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN vazio — configure o token do @encaminhadorAdmin_bot")
+        log.warning("BOT_TOKEN não definido; comandos desativados.")
+        return
 
     global bot_client
     bot_client = TelegramClient("admin_bot_session", API_ID, API_HASH)
@@ -278,11 +264,10 @@ async def setup_bot_commands():
     async def _start(ev):
         await ev.reply(
             "👋 Encaminhador online.\n\n"
-            "• `/admin_status` — status e tamanhos\n"
-            "• `/listgroups [OWNER_ID] [página] [tamanho]` — lista diálogos da sessão\n"
-            "• `/subscribe OWNER_ID BASE_ID` — assina um canal-base\n"
-            "• `/linkchat OWNER_ID BASE_ID CHAT_ID` — define/atualiza chat vinculado\n"
-            "• `/debug_allowed OWNER_ID` — mostra os ids que o UID está ouvindo\n"
+            "• `/admin_status` — status geral\n"
+            "• `/listgroups [OWNER_ID] [página] [tamanho]` — lista canais/grupos\n"
+            "• `/subscribe OWNER_ID BASE_ID` — assina um canal base\n"
+            "• `/linkchat OWNER_ID BASE_ID CHAT_ID` — vincula o chat do canal\n"
             "• Dashboard: abra `/dash` na url do Railway"
         )
 
@@ -292,7 +277,7 @@ async def setup_bot_commands():
             f"DEST_POSTS: {DEST_POSTS}",
             f"DEST_COMMENTS: {DEST_COMMENTS}",
             f"Sessões: {len(SESSIONS)} | Dinâmicos ON: {len(user_clients)}",
-            f"Links: {len(LINKS)} pares | POSTMAP: {len(last_post_by_base)}",
+            f"Links: {len(LINKS)} pares"
         ]
         for uid in sorted(user_clients.keys()):
             lines.append(f"- {uid}")
@@ -306,9 +291,10 @@ async def setup_bot_commands():
         size = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 50
         page = max(1, page)
         size = min(100, max(5, size))
+        await ev.reply(f"📋 Buscando grupos para owner `{uid}`... pode demorar um pouco.", parse_mode="Markdown")
         rows = await listgroups_for(uid, page, size)
-        await ev.reply(f"📋 *Grupos/Canais* (owner `{uid}`, pág {page}, tam {size}):\n" + "\n".join(rows),
-                       parse_mode="Markdown")
+        await ev.edit(f"📋 *Grupos/Canais* (owner `{uid}`, pág {page}, tam {size}):\n" + "\n".join(rows),
+                                   parse_mode="Markdown")
 
     @bot_client.on(events.NewMessage(pattern=r'^/subscribe'))
     async def _subscribe(ev):
@@ -323,7 +309,7 @@ async def setup_bot_commands():
         if base not in SUBS[owner]:
             SUBS[owner].append(base)
         await ensure_dynamic(owner, force=True)
-        await ev.reply(f"✅ {owner} assina `{base}`.", parse_mode="Markdown")
+        await ev.reply(f"✅ Assinado owner `{owner}` em `{base}`", parse_mode="Markdown")
 
     @bot_client.on(events.NewMessage(pattern=r'^/linkchat'))
     async def _link(ev):
@@ -336,41 +322,36 @@ async def setup_bot_commands():
         if base is None or chat is None:
             return await ev.reply("IDs inválidos.")
         LINKS[base] = chat
-        INV_LINKS.clear()
-        INV_LINKS.update({v: k for k, v in LINKS.items()})
         await ensure_dynamic(owner, force=True)
-        await ev.reply(f"🔗 {base} → {chat} vinculado para `{owner}`.", parse_mode="Markdown")
-
-    @bot_client.on(events.NewMessage(pattern=r'^/debug_allowed'))
-    async def _dbg(ev):
-        parts = ev.raw_text.strip().split()
-        if len(parts) != 2:
-            return await ev.reply("Uso: `/debug_allowed OWNER_ID`", parse_mode="Markdown")
-        uid = parts[1]
-        ids = allowed_for(uid)
-        await ev.reply("Allowed:\n" + "\n".join(map(str, ids)))
+        await ev.reply(f"🔗 Vinculado `{base}` → `{chat}` (owner `{owner}`)", parse_mode="Markdown")
 
     asyncio.create_task(bot_client.run_until_disconnected())
 
 # ───────────────────────────── MAIN ─────────────────────────────
 async def main():
+    # web
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # BOT primeiro (precisamos dele para postar)
+    # BOT primeiro (para garantir que bot_client exista antes de chegar msg)
     await setup_bot_commands()
 
-    # Subimos os 3 listeners (e amigos) já com force=True
+    # inicia dinâmicos para todos os donos configurados
     for uid in list(SESSIONS.keys()):
         try:
             await ensure_dynamic(uid, force=True)
         except Exception as e:
             log.exception(f"dyn {uid} fail on start: {e}")
 
-    log.info("🤖 pronto — BOT posta, sessão(ões) apenas escutam; reply por base->último post")
-
-    # pendurar em um cliente qualquer
-    any_cli = next(iter(user_clients.values()))
-    await any_cli.run_until_disconnected()
+    log.info("🤖 pronto (TRIADE, LF Tips, Psico) — envio via BOT, replies com fallback")
+    # pendura no primeiro cliente para aguardar
+    if user_clients:
+        any_cli = next(iter(user_clients.values()))
+        await any_cli.run_until_disconnected()
+    else:
+        log.warning("Nenhum user client foi iniciado. O bot pode não receber eventos.")
+        # Se não houver user clients, o bot ainda precisa ficar rodando
+        if bot_client:
+            await bot_client.run_until_disconnected()
 
 if __name__ == "__main__":
     asyncio.run(main())
