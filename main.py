@@ -1,12 +1,12 @@
-# main.py — v2, com comentários em posts e cópia forçada
+# main.py — hardcoded, envio via BOT, com listagem/assinatura ao vivo
 import os
 import asyncio
 import logging
 import threading
 from typing import Dict, List, Optional, Tuple
 
-from flask import Flask, Response
-import html as html_std
+from flask import Flask, jsonify, Response
+import html as html_std  # <<<<<< CORRETO
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import Message
@@ -17,8 +17,8 @@ log = logging.getLogger("encaminhador")
 
 # ───────────────────────────── HARD-CODE CONFIG ─────────────────────────────
 # Destinos
-DEST_POSTS: int = -1002650810578      # <<<<<< ALTERADO PARA O SEU CANAL DE POSTS (Repasse Vips)
-DEST_COMMENTS: int = -1002851540794   # <<<<<< ALTERADO PARA O SEU CANAL DE CHAT (Repasse Vips Chat)
+DEST_POSTS: int = -1002897690215      # canal de POSTS
+DEST_COMMENTS: int = -1002489338128   # canal de CHAT/clonagem de comentários
 
 # Pares base→chat (o que já sabemos)
 LINKS: Dict[int, int] = {
@@ -26,8 +26,6 @@ LINKS: Dict[int, int] = {
     -1002855377727: -1002813556527,  # LF Tips
     -1002468014496: -1002333613791,  # Psico
 }
-# Adicionando os canais de teste do seu screenshot para funcionar
-LINKS[DEST_POSTS] = DEST_COMMENTS
 
 # Strings de sessão (donos)
 SESSIONS: Dict[str, str] = {
@@ -38,24 +36,15 @@ SESSIONS: Dict[str, str] = {
 
 # Assinaturas por dono (apenas base; o chat vem de LINKS)
 SUBS: Dict[str, List[int]] = {
-    "786880968": [-1002794084735, -1002855377727, -1002468014496, DEST_POSTS], # Adicionado canal de teste
+    "786880968": [-1002794084735, -1002855377727, -1002468014496],  # triade, lf, psico
     "435374422": [-1002855377727],
     "6209300823": [-1002468014496],
 }
 
 # API e Bot
-API_ID = int(os.environ.get("TELEGRAM_API_ID", "2178028") or 0)
-API_HASH = os.environ.get("TELEGRAM_API_HASH", "b93c4731a5a12a524c52019702a46675") or ""
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-
-# ##################################################################
-# ##                 NOVAS ESTRUTURAS DE DADOS                    ##
-# ##################################################################
-# Mapa reverso para encontrar o canal base a partir do chat
-REVERSE_LINKS: Dict[int, int] = {v: k for k, v in LINKS.items()}
-# Mapa para armazenar a relação: (ID_canal_origem, ID_msg_origem) -> ID_msg_destino
-MESSAGE_MAP: Dict[Tuple[int, int], int] = {}
-
+API_ID = int(os.environ.get("TELEGRAM_API_ID", "0") or 0)
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "") or ""
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()  # @encaminhadorAdmin_bot
 
 # ───────────────────────────── Infra web ─────────────────────────────
 app = Flask("keep_alive")
@@ -63,63 +52,72 @@ app = Flask("keep_alive")
 @app.get("/")
 def root() -> str:
     return (
-        "<h3>Encaminhador v2 (comentários)</h3>"
+        "<h3>Encaminhador (hardcoded)</h3>"
         "<ul>"
         f"<li>DEST_POSTS: {DEST_POSTS}</li>"
+        f"<li>DEST_COMMENTS: {DEST_COMMENTS}</li>"
         f"<li>Sessões: {list(SESSIONS.keys())}</li>"
         f"<li>Links (pares): {len(LINKS)}</li>"
-        f"<li>Mensagens Mapeadas: {len(MESSAGE_MAP)}</li>"
         "</ul>"
+        '<p>Abra <code>/dash</code>.</p>'
     )
+
+@app.get("/health")
+def health() -> dict:
+    return {"ok": True, "sessions": len(SESSIONS)}
+
+@app.get("/dash")
+def dash() -> Response:
+    rows = []
+    rows.append("<h2>Resumo</h2>")
+    rows.append(f"<p>DEST_POSTS: {DEST_POSTS} | DEST_COMMENTS: {DEST_COMMENTS}</p>")
+    rows.append(f"<p>Sessões: {len(SESSIONS)} | Dinâmicos ON: {len(user_clients)}</p>")
+    rows.append("<h3>Links (base → chat)</h3><pre>")
+    for b, c in LINKS.items():
+        rows.append(f"{html_std.escape(str(b))} → {html_std.escape(str(c))}")
+    rows.append("</pre>")
+    return Response("\n".join(rows), mimetype="text/html")
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
 
-# ##################################################################
-# ##               LÓGICA DE ENVIO MODIFICADA                     ##
-# ##################################################################
-
+# ───────────────────────────── Core de envio ─────────────────────────────
 bot_client: Optional[TelegramClient] = None
 user_clients: Dict[str, TelegramClient] = {}
-user_handlers: Dict[str, Tuple] = {}
+user_handlers: Dict[str, Tuple] = {}  # uid -> (callback, event_builder)
 
 def is_chat_id(chat_id: int) -> bool:
     return chat_id in LINKS.values()
 
-async def copy_message(
-    dst: int,
-    m: Message,
-    reply_to: Optional[int] = None,
-    caption_prefix: str = ""
-) -> Optional[Message]:
-    """
-    Copia uma mensagem (baixa e envia), nunca encaminha.
-    Retorna a nova mensagem enviada para obter seu ID.
-    """
-    if not m:
-        return None
-    
-    final_caption = f"{caption_prefix}{m.text or ''}"
+def dst_for(chat_id: int) -> int:
+    return DEST_COMMENTS if is_chat_id(chat_id) else DEST_POSTS
 
+async def send_with_fallback(dst: int, m: Message):
     try:
-        new_message = None
+        await m.forward_to(dst)
+        return
+    except errors.FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        try:
+            await m.forward_to(dst)
+            return
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
         if m.media:
             path = await m.download_media()
-            new_message = await bot_client.send_file(
-                dst, path, caption=final_caption, reply_to=reply_to, parse_mode="Markdown"
-            )
-            os.remove(path) # Limpa o arquivo baixado
+            await bot_client.send_file(dst, path, caption=(m.text or ""))
         else:
-            new_message = await bot_client.send_message(
-                dst, final_caption, reply_to=reply_to, parse_mode="Markdown"
-            )
-        return new_message
+            await bot_client.send_message(dst, m.text or "")
     except errors.FloodWaitError as e:
-        await asyncio.sleep(e.seconds + 2)
-        return await copy_message(dst, m, reply_to, caption_prefix) # Tenta novamente
-    except Exception as e:
-        log.error(f"Falha ao copiar mensagem {m.id} para {dst}: {e}")
-        return None
+        await asyncio.sleep(e.seconds + 1)
+        if m.media:
+            path = await m.download_media()
+            await bot_client.send_file(dst, path, caption=(m.text or ""))
+        else:
+            await bot_client.send_message(dst, m.text or "")
 
 def allowed_for(uid: str) -> List[int]:
     bases = SUBS.get(uid, [])
@@ -137,7 +135,7 @@ async def ensure_dynamic(uid: str, force: bool = False) -> Optional[TelegramClie
 
     cli = user_clients.get(uid)
     if cli is None:
-        cli = TelegramClient(StringSession(sess), API_ID, API_HASH, base_logger=log)
+        cli = TelegramClient(StringSession(sess), API_ID, API_HASH)
         await cli.start()
         user_clients[uid] = cli
 
@@ -155,91 +153,167 @@ async def ensure_dynamic(uid: str, force: bool = False) -> Optional[TelegramClie
 
         async def _cb(ev: events.NewMessage.Event, _uid=uid):
             try:
-                source_cid = ev.chat_id
+                cid = ev.chat_id
+                dest = dst_for(cid)
+                ent = await cli.get_entity(cid)
+                title = getattr(ent, "title", None) or getattr(ent, "username", None) or str(cid)
 
-                # LÓGICA 1: A mensagem veio de um CHAT (é um comentário)
-                if is_chat_id(source_cid):
-                    if not ev.message.is_reply:
-                        log.info(f"Ignorando msg no chat {source_cid} que não é reply.")
-                        return
-
-                    base_cid = REVERSE_LINKS.get(source_cid)
-                    reply_to_id = ev.message.reply_to_msg_id
-                    
-                    if not base_cid:
-                        log.warning(f"Não achei canal base para o chat {source_cid}")
-                        return
-
-                    target_post_id = MESSAGE_MAP.get((base_cid, reply_to_id))
-                    if not target_post_id:
-                        log.warning(f"Não achei post de destino para a msg {reply_to_id} do canal {base_cid}")
-                        return
-
-                    # Prepara o comentário
+                if is_chat_id(cid):
                     sender = await ev.get_sender()
                     sname = " ".join(filter(None, [
                         getattr(sender, "first_name", None),
                         getattr(sender, "last_name", None),
-                    ])) or (getattr(sender, "username", "alguém"))
-                    
-                    prefix = f"**{sname}**:\n"
-                    
-                    await copy_message(
-                        DEST_POSTS,
-                        ev.message,
-                        reply_to=target_post_id,
-                        caption_prefix=prefix
-                    )
-                    log.info(f"Comentário de {sname} (chat {source_cid}) adicionado ao post {target_post_id}")
-
-                # LÓGICA 2: A mensagem veio de um canal BASE (é um post novo)
+                    ])) or (getattr(sender, "username", None) or "alguém")
+                    header = f"💬 *{title}* — {sname} (`{cid}`)"
                 else:
-                    ent = await cli.get_entity(source_cid)
-                    title = getattr(ent, "title", str(source_cid))
-                    header = f"📢 *{title}* (`{source_cid}`)"
-                    
-                    # Envia o cabeçalho como uma mensagem separada
-                    await bot_client.send_message(DEST_POSTS, header, parse_mode="Markdown")
-                    
-                    # Copia a mensagem principal
-                    sent_post = await copy_message(DEST_POSTS, ev.message)
+                    header = f"📢 *{title}* (`{cid}`)"
 
-                    # Salva o mapeamento se o post foi enviado com sucesso
-                    if sent_post:
-                        MESSAGE_MAP[(source_cid, ev.message.id)] = sent_post.id
-                        log.info(f"Post do canal {source_cid} (msg {ev.message.id}) mapeado para o post {sent_post.id}")
-
+                await bot_client.send_message(dest, header, parse_mode="Markdown")
+                await send_with_fallback(dest, ev.message)
+                log.info(f"[dyn {_uid}] {cid} -> {dest}")
             except Exception as e:
-                log.exception(f"[dyn {_uid}] falha geral: {e}")
+                log.exception(f"[dyn {_uid}] fail: {e}")
 
         cli.add_event_handler(_cb, evb)
         user_handlers[uid] = (_cb, evb)
         log.info(f"[dyn] ligado uid={uid} allowed={chats_list}")
     return cli
 
-# ───────────────────────────── Bot: comandos (sem alterações) ─────────────────────────────
-# ... (a seção de comandos do bot permanece a mesma)
+# ───────────────────────────── Bot: comandos ─────────────────────────────
+def parse_int(s: str) -> Optional[int]:
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+async def listgroups_for(uid: str, page: int, size: int) -> List[str]:
+    cli = user_clients.get(uid)
+    temp = False
+    if cli is None:
+        sess = SESSIONS.get(uid)
+        if not sess:
+            return ["UID desconhecido."]
+        cli = TelegramClient(StringSession(sess), API_ID, API_HASH)
+        await cli.start()
+        temp = True
+
+    out, grabbed = [], 0
+    want = page * size
+    async for dlg in cli.iter_dialogs(limit=3000):
+        ent = dlg.entity
+        if getattr(ent, "megagroup", False) or getattr(ent, "broadcast", False):
+            cid = getattr(ent, "id", None)
+            title = getattr(ent, "title", None) or getattr(ent, "username", None) or str(cid)
+            grabbed += 1
+            if grabbed > (page - 1) * size and len(out) < size:
+                out.append(f"- `{cid}` — {title}")
+            if grabbed >= want:
+                break
+
+    if temp:
+        try:
+            await cli.disconnect()
+        except Exception:
+            pass
+
+    if not out:
+        out.append("(vazio)")
+    return out
+
+async def setup_bot_commands():
+    if not BOT_TOKEN:
+        log.warning("BOT_TOKEN não definido; comandos desativados.")
+        return
+
+    global bot_client
+    bot_client = TelegramClient("admin_bot_session", API_ID, API_HASH)
+    await bot_client.start(bot_token=BOT_TOKEN)
+
+    @bot_client.on(events.NewMessage(pattern=r'^/start$'))
+    async def _start(ev):
+        await ev.reply(
+            "👋 Encaminhador online.\n\n"
+            "• `/admin_status` — status geral\n"
+            "• `/listgroups [OWNER_ID] [página] [tamanho]` — lista canais/grupos\n"
+            "• `/subscribe OWNER_ID BASE_ID` — assina um canal base\n"
+            "• `/linkchat OWNER_ID BASE_ID CHAT_ID` — vincula o chat do canal\n"
+            "• Dashboard: abra `/dash` na url do Railway"
+        )
+
+    @bot_client.on(events.NewMessage(pattern=r'^/admin_status$'))
+    async def _status(ev):
+        lines = [
+            f"DEST_POSTS: {DEST_POSTS}",
+            f"DEST_COMMENTS: {DEST_COMMENTS}",
+            f"Sessões: {len(SESSIONS)} | Dinâmicos ON: {len(user_clients)}",
+            f"Links: {len(LINKS)} pares"
+        ]
+        for uid in sorted(user_clients.keys()):
+            lines.append(f"- {uid}")
+        await ev.reply("\n".join(lines))
+
+    @bot_client.on(events.NewMessage(pattern=r'^/listgroups'))
+    async def _list(ev):
+        parts = ev.raw_text.strip().split()
+        uid = (parts[1] if len(parts) >= 2 and parts[1].isdigit() else "786880968")
+        page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
+        size = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 50
+        page = max(1, page)
+        size = min(100, max(5, size))
+        rows = await listgroups_for(uid, page, size)
+        await ev.reply(f"📋 *Grupos/Canais* (owner `{uid}`, pág {page}, tam {size}):\n" + "\n".join(rows),
+                       parse_mode="Markdown")
+
+    @bot_client.on(events.NewMessage(pattern=r'^/subscribe'))
+    async def _subscribe(ev):
+        parts = ev.raw_text.strip().split()
+        if len(parts) != 3:
+            return await ev.reply("Uso: `/subscribe OWNER_ID BASE_CHANNEL_ID`", parse_mode="Markdown")
+        owner = parts[1]
+        base = parse_int(parts[2])
+        if base is None:
+            return await ev.reply("ID inválido.")
+        SUBS.setdefault(owner, [])
+        if base not in SUBS[owner]:
+            SUBS[owner].append(base)
+        await ensure_dynamic(owner, force=True)
+        await ev.reply(f"✅ Assinado owner `{owner}` em `{base}`", parse_mode="Markdown")
+
+    @bot_client.on(events.NewMessage(pattern=r'^/linkchat'))
+    async def _link(ev):
+        parts = ev.raw_text.strip().split()
+        if len(parts) != 4:
+            return await ev.reply("Uso: `/linkchat OWNER_ID BASE_ID CHAT_ID`", parse_mode="Markdown")
+        owner = parts[1]
+        base = parse_int(parts[2])
+        chat = parse_int(parts[3])
+        if base is None or chat is None:
+            return await ev.reply("IDs inválidos.")
+        LINKS[base] = chat
+        await ensure_dynamic(owner, force=True)
+        await ev.reply(f"🔗 Vinculado `{base}` → `{chat}` (owner `{owner}`)", parse_mode="Markdown")
+
+    asyncio.create_task(bot_client.run_until_disconnected())
 
 # ───────────────────────────── MAIN ─────────────────────────────
 async def main():
     # web
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # BOT primeiro
-    global bot_client
-    bot_client = TelegramClient("admin_bot_session", API_ID, API_HASH)
-    await bot_client.start(bot_token=BOT_TOKEN)
-    # Aqui iriam os @bot_client.on(...) se você os movesse para uma função
+    # BOT primeiro (para garantir que bot_client exista antes de chegar msg)
+    await setup_bot_commands()
 
-    # inicia dinâmicos
+    # inicia dinâmicos para todos os donos configurados
     for uid in list(SESSIONS.keys()):
         try:
             await ensure_dynamic(uid, force=True)
         except Exception as e:
             log.exception(f"dyn {uid} fail on start: {e}")
 
-    log.info("🤖 pronto v2 (comentários em posts)")
-    await bot_client.run_until_disconnected()
+    log.info("🤖 pronto (TRIADE, LF Tips, Psico) — envio via BOT, replies com fallback")
+    # pendura no primeiro cliente para aguardar
+    any_cli = next(iter(user_clients.values()))
+    await any_cli.run_until_disconnected()
 
 if __name__ == "__main__":
     asyncio.run(main())
