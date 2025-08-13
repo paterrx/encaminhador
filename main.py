@@ -5,7 +5,8 @@ import logging
 import threading
 from typing import Dict, List, Optional, Tuple
 
-from flask import Flask, jsonify, Response, html
+from flask import Flask, jsonify, Response
+import html as html_std  # <<<<<< CORRETO
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import Message
@@ -67,18 +68,13 @@ def health() -> dict:
 
 @app.get("/dash")
 def dash() -> Response:
-    def esc(x): 
-        try: 
-            return html.escape(str(x))
-        except Exception:
-            return str(x)
     rows = []
     rows.append("<h2>Resumo</h2>")
     rows.append(f"<p>DEST_POSTS: {DEST_POSTS} | DEST_COMMENTS: {DEST_COMMENTS}</p>")
     rows.append(f"<p>Sessões: {len(SESSIONS)} | Dinâmicos ON: {len(user_clients)}</p>")
     rows.append("<h3>Links (base → chat)</h3><pre>")
     for b, c in LINKS.items():
-        rows.append(f"{b} → {c}")
+        rows.append(f"{html_std.escape(str(b))} → {html_std.escape(str(c))}")
     rows.append("</pre>")
     return Response("\n".join(rows), mimetype="text/html")
 
@@ -86,12 +82,8 @@ def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
 
 # ───────────────────────────── Core de envio ─────────────────────────────
-ADMIN_UID = "786880968"  # só referência; envio é via BOT
 bot_client: Optional[TelegramClient] = None
-
-# clientes por dono
 user_clients: Dict[str, TelegramClient] = {}
-# handler registrado por dono (para podermos atualizar o filtro "chats")
 user_handlers: Dict[str, Tuple] = {}  # uid -> (callback, event_builder)
 
 def is_chat_id(chat_id: int) -> bool:
@@ -137,7 +129,6 @@ def allowed_for(uid: str) -> List[int]:
     return sorted(list(s))
 
 async def ensure_dynamic(uid: str, force: bool = False) -> Optional[TelegramClient]:
-    # inicia ou reaplica handler com lista "chats" atualizada
     sess = SESSIONS.get(uid)
     if not sess:
         return None
@@ -148,7 +139,6 @@ async def ensure_dynamic(uid: str, force: bool = False) -> Optional[TelegramClie
         await cli.start()
         user_clients[uid] = cli
 
-    # remove handler anterior (se houver)
     if force and uid in user_handlers:
         cb, evb = user_handlers.pop(uid, (None, None))
         if cb and evb:
@@ -157,7 +147,6 @@ async def ensure_dynamic(uid: str, force: bool = False) -> Optional[TelegramClie
             except Exception:
                 pass
 
-    # registra handler com filtro atualizado
     if uid not in user_handlers:
         chats_list = allowed_for(uid)
         evb = events.NewMessage(chats=chats_list)
@@ -198,7 +187,6 @@ def parse_int(s: str) -> Optional[int]:
         return None
 
 async def listgroups_for(uid: str, page: int, size: int) -> List[str]:
-    # usa cliente existente se houver (senão, abre temporário)
     cli = user_clients.get(uid)
     temp = False
     if cli is None:
@@ -267,11 +255,7 @@ async def setup_bot_commands():
     @bot_client.on(events.NewMessage(pattern=r'^/listgroups'))
     async def _list(ev):
         parts = ev.raw_text.strip().split()
-        # formatos:
-        # /listgroups
-        # /listgroups OWNER_ID
-        # /listgroups OWNER_ID page size
-        uid = (parts[1] if len(parts) >= 2 and parts[1].isdigit() else ADMIN_UID)
+        uid = (parts[1] if len(parts) >= 2 and parts[1].isdigit() else "786880968")
         page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
         size = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 50
         page = max(1, page)
@@ -316,6 +300,9 @@ async def main():
     # web
     threading.Thread(target=run_flask, daemon=True).start()
 
+    # BOT primeiro (para garantir que bot_client exista antes de chegar msg)
+    await setup_bot_commands()
+
     # inicia dinâmicos para todos os donos configurados
     for uid in list(SESSIONS.keys()):
         try:
@@ -323,11 +310,8 @@ async def main():
         except Exception as e:
             log.exception(f"dyn {uid} fail on start: {e}")
 
-    # bot de comando (envio e cabeçalhos também usam esse bot)
-    await setup_bot_commands()
-
     log.info("🤖 pronto (TRIADE, LF Tips, Psico) — envio via BOT, replies com fallback")
-    # pendura no primeiro cliente (qualquer um) só para aguardar; o bot já fica em run_until_disconnected
+    # pendura no primeiro cliente para aguardar
     any_cli = next(iter(user_clients.values()))
     await any_cli.run_until_disconnected()
 
