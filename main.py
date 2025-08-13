@@ -1,4 +1,4 @@
-# main.py — BOT único, cópia (sem forward), reply fixado por âncora estável
+# main.py — BOT único, cópia (sem forward), reply correto com fila de pendências
 import os
 import asyncio
 import logging
@@ -72,28 +72,44 @@ def dash() -> Response:
     rows.append("<h3>Âncoras</h3><pre>")
     for base, sub in post_map.items():
         for top_src, dest_id in sub.items():
-            rows.append(f"base {base} :: {top_src} → {dest_id}")
+            rows.append(f"{base} :: src_top {top_src} → dest {dest_id}")
+    rows.append("</pre>")
+    rows.append("<h3>Pendências</h3><pre>")
+    for k, lst in pending.items():
+        rows.append(f"{k} :: {len(lst)} msgs")
     rows.append("</pre>")
     return Response("\n".join(rows), mimetype="text/html")
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
 
-# ───────────────────────────── ESTADO (reply map) ─────────────────────────────
+# ───────────────────────────── ESTADO (âncoras + fila) ─────────────────────────────
 post_map: Dict[int, Dict[int, int]] = {}        # base_id -> {src_top_id: dest_post_id}
-last_anchor: Dict[int, Tuple[int, int]] = {}    # base_id -> (src_top_id, dest_post_id)
+pending: Dict[Tuple[int, int], List[Tuple[TelegramClient, Message, int, str, str]]] = {}
+# (base_id, top_src_id) -> [(cli, msg, cid, title, who), ...]
 
 def set_anchor(base_id: int, src_top_id: int, dest_id: int):
     post_map.setdefault(base_id, {})[src_top_id] = dest_id
-    last_anchor[base_id] = (src_top_id, dest_id)
+    # flush pendências
+    key = (base_id, src_top_id)
+    lst = pending.pop(key, [])
+    if lst:
+        log.info(f"[flush] {len(lst)} pendente(s) para base={base_id} top_src={src_top_id}")
+        asyncio.create_task(_flush_list(lst, dest_id))
+
+async def _flush_list(lst, anchor_id: int):
+    for cli, msg, cid, title, who in lst:
+        try:
+            header = f"💬 *{title}* — {who} (`{cid}`)"
+            await bot_client.send_message(DEST_COMMENTS, header, parse_mode="Markdown", reply_to=anchor_id)
+            await _send_copy(DEST_COMMENTS, msg, reply_to=anchor_id)
+        except Exception as e:
+            log.exception(f"[flush] erro: {e}")
 
 def get_anchor(base_id: int, src_top_id: Optional[int]) -> Optional[int]:
-    if src_top_id is not None:
-        got = post_map.get(base_id, {}).get(src_top_id)
-        if got:
-            return got
-    la = last_anchor.get(base_id)
-    return la[1] if la else None
+    if src_top_id is None:
+        return None
+    return post_map.get(base_id, {}).get(src_top_id)
 
 # ───────────────────────────── CLIENTES ─────────────────────────────
 bot_client: Optional[TelegramClient] = None
@@ -131,11 +147,20 @@ def _title(ent) -> str:
     return getattr(ent, "title", None) or getattr(ent, "username", None) or str(getattr(ent, "id", "?"))
 
 def _extract_top_id(m: Message) -> Optional[int]:
+    """
+    Tenta extrair o id do post do canal referenciado por um comentário no chat.
+    Cobre vários formatos que o Telegram usa.
+    """
     try:
         rt = getattr(m, "reply_to", None)
-        top = getattr(rt, "reply_to_top_id", None)
-        if top:
-            return int(top)
+        if rt:
+            top = getattr(rt, "reply_to_top_id", None)
+            if top:
+                return int(top)
+            # alguns casos trazem 'reply_to_msg_id' que já é o top
+            rmid = getattr(rt, "reply_to_msg_id", None)
+            if rmid:
+                return int(rmid)
     except Exception:
         pass
     try:
@@ -183,33 +208,40 @@ async def ensure_dynamic(uid: str, force: bool = False) -> Optional[TelegramClie
                 cid = ev.chat_id
                 ent = await cli.get_entity(cid)
                 title = _title(ent)
-                dest = dest_for(cid)
 
-                # 1) Mensagens no canal-base → copia e cria âncora com o ID REAL retornado
+                # 1) Mensagens no canal-base → copia, pega id real e registra âncora
                 if not is_chat_id(cid):
                     header = f"📢 *{title}* (`{cid}`)"
-                    await bot_client.send_message(dest, header, parse_mode="Markdown")
-                    content_id = await _send_copy(dest, ev.message, reply_to=None)
+                    await bot_client.send_message(DEST_POSTS, header, parse_mode="Markdown")
+                    content_id = await _send_copy(DEST_POSTS, ev.message, reply_to=None)
                     set_anchor(cid, ev.id, content_id)
                     log.info(f"[post] base={cid} src_top={ev.id} -> dest_id={content_id}")
                     return
 
-                # 2) Mensagens no chat (vinculado ao post)
+                # 2) Mensagens no chat → precisa de âncora do post
                 base_id = INV_LINKS.get(cid)
 
-                # Ignora o "espelho" que o Telegram injeta no chat (fwd_from do canal)
+                # ignora o "espelho" que o Telegram injeta no chat
                 if getattr(ev.message, "fwd_from", None) is not None and ev.message.reply_to is None:
                     log.debug(f"[chat] espelho ignorado base={base_id}")
                     return
 
-                top_src = _extract_top_id(ev.message)  # geralmente vem certinho
-                anchor_dest = get_anchor(base_id, top_src)  # senão, usa último da base
+                top_src = _extract_top_id(ev.message)
+                anchor_dest = get_anchor(base_id, top_src)
 
                 sender = await ev.get_sender()
                 who = _sender_name(sender)
+
+                if anchor_dest is None:
+                    # ainda não temos âncora: guarda e responde quando o post chegar
+                    key = (base_id, top_src or -1)
+                    pending.setdefault(key, []).append((cli, ev.message, cid, title, who))
+                    log.info(f"[queue] +1 pendente base={base_id} top_src={top_src}")
+                    return
+
                 header = f"💬 *{title}* — {who} (`{cid}`)"
-                await bot_client.send_message(dest, header, parse_mode="Markdown", reply_to=anchor_dest)
-                await _send_copy(dest, ev.message, reply_to=anchor_dest)
+                await bot_client.send_message(DEST_COMMENTS, header, parse_mode="Markdown", reply_to=anchor_dest)
+                await _send_copy(DEST_COMMENTS, ev.message, reply_to=anchor_dest)
                 log.info(f"[chat] base={base_id} top_src={top_src} -> reply_to={anchor_dest}")
             except Exception as e:
                 log.exception(f"[dyn {_uid}] fail: {e}")
@@ -283,7 +315,8 @@ async def setup_bot_commands():
             f"DEST_POSTS: {DEST_POSTS}",
             f"DEST_COMMENTS: {DEST_COMMENTS}",
             f"Sessões: {len(SESSIONS)} | Dinâmicos ON: {len(user_clients)}",
-            f"Links: {len(LINKS)} pares | POSTMAP: {sum(len(v) for v in post_map.values())}",
+            f"Links: {len(LINKS)} pares | ANCORAS: {sum(len(v) for v in post_map.values())}",
+            f"Pendências: {sum(len(v) for v in pending.values())}",
         ]
         for uid in sorted(user_clients.keys()):
             lines.append(f"- {uid}")
@@ -342,7 +375,7 @@ async def main():
             await ensure_dynamic(uid, force=True)
         except Exception as e:
             log.exception(f"dyn {uid} fail on start: {e}")
-    log.info("🤖 pronto — cópia sempre (sem forward) + reply por âncora estável")
+    log.info("🤖 pronto — cópia sempre (sem forward) + reply com fila anti-race")
     any_cli = next(iter(user_clients.values()))
     await any_cli.run_until_disconnected()
 
