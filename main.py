@@ -45,7 +45,7 @@ SUBS: Dict[str, List[int]] = {
 # ───────────────────────────── CREDENCIAIS ─────────────────────────────
 API_ID  = int(os.environ.get("TELEGRAM_API_ID", "0") or 0)
 API_HASH= os.environ.get("TELEGRAM_API_HASH", "") or ""
-BOT_TOKEN = os.environ.get("BOT_TOKEN_ENCAMINHADORADMIN", "").strip()  # 8226...J59o
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()  # 8226...J59o
 
 # ───────────────────────────── Infra Flask ─────────────────────────────
 app = Flask("keep_alive")
